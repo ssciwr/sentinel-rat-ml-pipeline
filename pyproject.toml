@@ -3,6 +3,15 @@ name = "sentinel-rat-ml-pipeline"
 version = "0.1.0"
 requires-python = ">=3.13"
 description = "FastAPI microservice for animal detection and species classification"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+authors = [
+    { name="Harald Mack", email="ssc@iwr.uni-heidelberg.de" },
+    { name="Tuyen Le", email="ssc@iwr.uni-heidelberg.de" },
+]
 dependencies = [
     "fastapi>=0.111.0",
     "uvicorn[standard]>=0.30.0",
