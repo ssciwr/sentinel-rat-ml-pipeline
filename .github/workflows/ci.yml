@@ -32,4 +32,11 @@ jobs:
         run: uv sync --locked --extra dev
 
       - name: Run tests
-        run: uv run pytest -v --cov=ml_pipeline --cov-report=term-missing
+        run: uv run pytest -v --cov=ml_pipeline --cov-branch --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: ssciwr/sentinel-rat-ml-pipeline
+          files: coverage.xml
