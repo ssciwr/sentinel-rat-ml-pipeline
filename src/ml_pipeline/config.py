@@ -1,13 +1,12 @@
 """Application configuration."""
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    ML_PIPELINE_PORT: int = 8000
+    model_config = SettingsConfigDict(env_prefix="")
 
-    class Config:
-        env_prefix = ""
+    ML_PIPELINE_PORT: int = 8000
 
 
 settings = Settings()

@@ -13,3 +13,9 @@ env/
 # IDE
 .vscode/
 .idea/
+
+# Build and test artifacts
+*.egg-info/
+build/
+.pytest_cache/
+.coverage
