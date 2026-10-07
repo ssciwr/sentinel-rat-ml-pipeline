@@ -3,11 +3,11 @@
 from fastapi import APIRouter, status
 
 from ml_pipeline.schemas.analysis import AnalyzeRequest, AnalyzeResponse
-from ml_pipeline.services.detection import detect_animals
+from ml_pipeline.services.analysis import analyze_images
 
 router = APIRouter()
 
 
 @router.post("/analyze", response_model=AnalyzeResponse, status_code=status.HTTP_200_OK)
-def analyze_image(payload: AnalyzeRequest) -> AnalyzeResponse:
-    return detect_animals(payload.image_path)
+def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
+    return analyze_images(payload.image_paths)
