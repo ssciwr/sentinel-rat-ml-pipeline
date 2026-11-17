@@ -49,6 +49,6 @@ class ImageResult(BaseModel):
 
 
 class AnalyzeResponse(BaseModel):
-    """One result per requested image, in request order."""
+    """One result per requested image that could be read, in request order."""
 
     results: list[ImageResult]

@@ -13,14 +13,14 @@ def test_health_endpoint() -> None:
     assert response.json() == {"status": "ok"}
 
 
-def test_analyze_endpoint() -> None:
+def test_analyze_endpoint(watch_folder) -> None:
     response = client.post(
         "/api/v1/analyze",
-        json={"image_paths": ["/fake/a.jpg", "/fake/b.jpg"]},
+        json={"image_paths": ["hd-zoo-01/a.jpg", "hd-zoo-01/b.jpg"]},
     )
     assert response.status_code == 200
     results = response.json()["results"]
-    assert [r["image_path"] for r in results] == ["/fake/a.jpg", "/fake/b.jpg"]
+    assert [r["image_path"] for r in results] == ["hd-zoo-01/a.jpg", "hd-zoo-01/b.jpg"]
 
     result = results[0]
     assert result["detection_model"]["name"] == "megadetector"
@@ -38,6 +38,15 @@ def test_analyze_endpoint() -> None:
     assert detection["classifications"][0]["family"] == "Muridae"
     assert result["detections"][1]["detected_class"] == "person"
     assert result["detections"][1]["classifications"] == []
+
+
+def test_analyze_endpoint_leaves_out_missing_images(watch_folder) -> None:
+    response = client.post(
+        "/api/v1/analyze",
+        json={"image_paths": ["hd-zoo-01/missing.jpg", "hd-zoo-01/a.jpg"]},
+    )
+    assert response.status_code == 200
+    assert [r["image_path"] for r in response.json()["results"]] == ["hd-zoo-01/a.jpg"]
 
 
 def test_analyze_endpoint_rejects_empty_list() -> None:

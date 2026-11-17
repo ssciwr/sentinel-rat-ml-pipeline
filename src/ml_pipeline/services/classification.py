@@ -17,8 +17,9 @@ _MURIDAE = {
 }
 
 
-def classify_species(image_path: str, detection: Detection) -> list[Classification]:
-    """Return species candidates for one detected animal, most likely first."""
+def classify_species(image: bytes, detection: Detection) -> list[Classification]:
+    """Return species candidates for one detected animal in the image (its file
+    content), most likely first."""
     # TODO: replace with real classification model
     return [
         Classification(

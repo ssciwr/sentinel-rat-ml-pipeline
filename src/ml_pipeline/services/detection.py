@@ -9,8 +9,9 @@ DETECTION_MODEL = ModelInfo(
 )
 
 
-def detect_animals(image_path: str) -> list[Detection]:
-    """Detect objects in one image, without species classifications."""
+def detect_animals(image: bytes) -> list[Detection]:
+    """Detect objects in one image (its file content), without species
+    classifications."""
     # TODO: replace with real model inference
     return [
         Detection(
