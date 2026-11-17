@@ -1,6 +1,6 @@
 """Schemas for ML pipeline requests and responses."""
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AnalyzeRequest(BaseModel):
@@ -22,7 +22,12 @@ class BoundingBox(BaseModel):
     y_max: float
 
 
-class Classification(BaseModel):
+class Taxon(BaseModel):
+    """Taxonomy of one species class, as configured for a classifier's output index."""
+
+    # Taxonomy comes from config files: a misspelled key must be an error, not silently dropped.
+    model_config = ConfigDict(extra="forbid")
+
     kingdom: str | None = None
     phylum: str | None = None
     class_name: str | None = None
@@ -31,6 +36,11 @@ class Classification(BaseModel):
     genus: str
     species: str | None = None
     common_name: str | None = None
+
+
+class Classification(Taxon):
+    """A taxon with the classifier's confidence for it."""
+
     confidence: float
 
 
