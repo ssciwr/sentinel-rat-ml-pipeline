@@ -16,5 +16,7 @@ def watch_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         path = tmp_path / image
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"fake jpeg")
+
+    # point WATCH_FOLDER_DOCKER to the temporary watch folder for testing
     monkeypatch.setattr(settings, "WATCH_FOLDER_DOCKER", str(tmp_path))
     return tmp_path

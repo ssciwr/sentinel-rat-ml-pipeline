@@ -15,7 +15,8 @@ def test_read_image_from_watch_folder(watch_folder: Path) -> None:
 @pytest.mark.parametrize(
     "image_path", ["/etc/passwd", "../outside.jpg", "x/../../y.jpg"]
 )
-def test_read_image_outside_watch_folder(watch_folder: Path, image_path: str) -> None:
+@pytest.mark.usefixtures("watch_folder")
+def test_read_image_outside_watch_folder(image_path: str) -> None:
     with pytest.raises(ValueError):
         read_image(image_path)
 
@@ -32,6 +33,7 @@ def test_read_image_symlink_outside_watch_folder(
         read_image("hd-zoo-01/link.jpg")
 
 
-def test_read_image_missing(watch_folder: Path) -> None:
+@pytest.mark.usefixtures("watch_folder")
+def test_read_image_missing() -> None:
     with pytest.raises(OSError):
         read_image("hd-zoo-01/missing.jpg")

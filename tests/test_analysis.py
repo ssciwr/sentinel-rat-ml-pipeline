@@ -2,11 +2,14 @@
 
 import logging
 
+import pytest
+
 from ml_pipeline.schemas.analysis import AnalyzeResponse
 from ml_pipeline.services.analysis import analyze_images
 
 
-def test_analyze_images(watch_folder) -> None:
+@pytest.mark.usefixtures("watch_folder")
+def test_analyze_images() -> None:
     response = analyze_images(["hd-zoo-01/a.jpg", "hd-zoo-01/b.jpg"])
     assert isinstance(response, AnalyzeResponse)
     # the requested, relative paths are returned
@@ -24,7 +27,8 @@ def test_analyze_images(watch_folder) -> None:
     assert person.classifications == []
 
 
-def test_analyze_images_skips_unreadable(watch_folder, caplog) -> None:
+@pytest.mark.usefixtures("watch_folder")
+def test_analyze_images_skips_unreadable(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.ERROR):
         response = analyze_images(
             ["hd-zoo-01/missing.jpg", "hd-zoo-01/b.jpg", "../outside.jpg"]
@@ -35,5 +39,6 @@ def test_analyze_images_skips_unreadable(watch_folder, caplog) -> None:
     assert "Skipping ../outside.jpg" in caplog.text
 
 
-def test_analyze_images_none_readable(watch_folder) -> None:
+@pytest.mark.usefixtures("watch_folder")
+def test_analyze_images_none_readable() -> None:
     assert analyze_images(["hd-zoo-01/missing.jpg"]).results == []

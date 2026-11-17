@@ -1,5 +1,6 @@
 """Tests for the ML Pipeline app."""
 
+import pytest
 from fastapi.testclient import TestClient
 
 from ml_pipeline.main import app
@@ -13,7 +14,8 @@ def test_health_endpoint() -> None:
     assert response.json() == {"status": "ok"}
 
 
-def test_analyze_endpoint(watch_folder) -> None:
+@pytest.mark.usefixtures("watch_folder")
+def test_analyze_endpoint() -> None:
     response = client.post(
         "/api/v1/analyze",
         json={"image_paths": ["hd-zoo-01/a.jpg", "hd-zoo-01/b.jpg"]},
@@ -40,7 +42,8 @@ def test_analyze_endpoint(watch_folder) -> None:
     assert result["detections"][1]["classifications"] == []
 
 
-def test_analyze_endpoint_leaves_out_missing_images(watch_folder) -> None:
+@pytest.mark.usefixtures("watch_folder")
+def test_analyze_endpoint_leaves_out_missing_images() -> None:
     response = client.post(
         "/api/v1/analyze",
         json={"image_paths": ["hd-zoo-01/missing.jpg", "hd-zoo-01/a.jpg"]},
