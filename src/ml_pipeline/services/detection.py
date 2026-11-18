@@ -1,26 +1,52 @@
-"""Animal detection service."""
+"""Detection service: runs the configured detector on one image."""
 
-from ml_pipeline.schemas.analysis import BoundingBox, Detection, ModelInfo
+import functools
 
-DETECTION_MODEL = ModelInfo(
-    name="megadetector",
-    version="v5a",
-    description="Simulated detector (animal, person, vehicle)",
-)
+from PIL import Image
+
+from ml_pipeline.config import settings
+from ml_pipeline.models.model import DetectorBase, load_model
+from ml_pipeline.schemas.analysis import Detection, ModelInfo
 
 
-def detect_animals(image_path: str) -> list[Detection]:
-    """Detect objects in one image, without species classifications."""
-    # TODO: replace with real model inference
-    return [
-        Detection(
-            detected_class="animal",
-            confidence=0.92,
-            bbox=BoundingBox(x_min=0.1, y_min=0.2, x_max=0.4, y_max=0.5),
-        ),
-        Detection(
-            detected_class="person",
-            confidence=0.81,
-            bbox=BoundingBox(x_min=0.6, y_min=0.1, x_max=0.9, y_max=0.95),
-        ),
-    ]
+def detect_animals(image: Image.Image) -> list[Detection]:
+    """Detect objects in one image.
+
+    Args:
+        image: An RGB image.
+
+    Returns:
+        All detections above the detector's confidence limit, most confident first, each
+        labelled (`detected_class`) and without species classifications.
+
+    Raises:
+        RuntimeError: No detector is configured (`DETECTOR_CONFIG` is unset).
+        TypeError: `DETECTOR_CONFIG` configures a model that is not a detector.
+    """
+    _, detections = _detector().predict(image)
+    return detections
+
+
+def detection_model() -> ModelInfo:
+    """Name, version and description of the configured detector.
+
+    Raises:
+        RuntimeError: No detector is configured (`DETECTOR_CONFIG` is unset).
+        TypeError: `DETECTOR_CONFIG` configures a model that is not a detector.
+    """
+    return _detector().info
+
+
+@functools.cache
+def _detector() -> DetectorBase:
+    """Build the detector from `settings.DETECTOR_CONFIG` on first use, then reuse it.
+
+    The model is cached per process for now; a later change replaces this with a session object
+    that can load and reload models on request.
+    """
+    if settings.DETECTOR_CONFIG is None:
+        raise RuntimeError("no detector configured: set the DETECTOR_CONFIG environment variable to a model config file")
+    model = load_model(settings.DETECTOR_CONFIG)
+    if not isinstance(model, DetectorBase):
+        raise TypeError(f"DETECTOR_CONFIG must configure a detector, got {type(model).__name__}")
+    return model

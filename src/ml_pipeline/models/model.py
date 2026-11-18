@@ -1,54 +1,38 @@
-"""Model handling: load detectors and classifiers and run them on lists of image paths.
+"""Model handling: build detectors and classifiers from config files and run them on one image.
 
-Every model follows one contract (see planning/plan_model_handling.md):
+Every model follows one contract:
 
-- it is built from keyword arguments or, equivalently, from a YAML config file with the
-  same keys (`from_config`);
+- it is built from keyword arguments or, equivalently, from a YAML config file with the same
+  keys plus a `type` key naming the model class (`load_model`);
+- `info` (name, version, description) names the model in API responses;
 - weights come from exactly one source: a local `model_path`, or a Hugging Face Hub file
   (`hf_repo` + `hf_filename`, optional `hf_revision`);
 - a `preprocessing` node (possibly empty) holds torchvision v2 transforms;
-- `predict(image_paths)` loads the images, preprocesses them, runs the model in batches and
-  returns `(probabilities, payload)` with one entry per image, in input order:
-  detectors return box scores and `BoundingBox` lists (class-agnostic), classifiers return
-  full probability vectors and `Classification` lists.
+- `predict(image)` takes one RGB PIL image (loading files is the caller's job), preprocesses it,
+  runs the model and returns `(probabilities, payload)`: detectors return box scores and labelled
+  `Detection`s, classifiers return the full probability vector and `Classification`s.
 
-All inference runs on CPU.
+There is no batching: every call processes one image. All inference runs on CPU.
 """
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Self
+from typing import Any
 
 import torch
 import yaml
 from huggingface_hub import hf_hub_download
-from PIL import Image, ImageOps
+from PIL import Image
 from speciesnet.detector import SpeciesNetDetector
 from torchvision.transforms import v2
 from torchvision.transforms.v2 import functional as tv_functional
 from ultralytics import YOLO
 from ultralytics.utils.downloads import GITHUB_ASSETS_NAMES
 
-from ml_pipeline.schemas.analysis import BoundingBox, Classification, Taxon
+from ml_pipeline.schemas.analysis import BoundingBox, Classification, Detection, ModelInfo, Taxon
 
 # ------------------------------------------------------------------ module helpers
-
-
-def load_image(path: str | Path) -> Image.Image:
-    """Load an image as RGB, with its EXIF orientation applied.
-
-    Args:
-        path: Path of the image file.
-
-    Returns:
-        The decoded RGB image.
-
-    Raises:
-        FileNotFoundError: The file does not exist.
-    """
-    with Image.open(path) as image:
-        return ImageOps.exif_transpose(image).convert("RGB")
 
 
 def build_transform(preprocessing: Mapping[str, Mapping[str, Any]] | None) -> v2.Transform:
@@ -167,114 +151,6 @@ def ensure_pil(image: Any) -> Image.Image:
     return image
 
 
-# --------------------------------------------------------------------- base classes
-
-
-class ModelBase[T](ABC):
-    """Common construction and `predict` flow of all models.
-
-    Subclasses implement `_load_model` (backend loading) and `_infer` (one batch of
-    preprocessed images to per-image results). Subclasses with extra arguments validate them
-    before calling `super().__init__`, so configuration errors surface before any download.
-
-    Args:
-        preprocessing: torchvision v2 transforms, see `build_transform`. Required; may be empty.
-        conf_limit: Minimum confidence in [0, 1] of returned boxes / classes.
-        batch_size: Images per model call; `None` passes all images of a `predict` call at once.
-        model_path: Local weights or backend identifier.
-        hf_repo: Hugging Face Hub repository with the weights (instead of `model_path`).
-        hf_filename: File in `hf_repo`.
-        hf_revision: Optional revision of `hf_repo`.
-
-    Raises:
-        TypeError: An argument has the wrong type.
-        ValueError: An argument has an invalid value.
-    """
-
-    DEVICE = "cpu"  # all inference runs on CPU: the inference server has no GPU
-
-    def __init__(
-        self,
-        *,
-        preprocessing: Mapping[str, Mapping[str, Any]] | None,
-        conf_limit: float,
-        batch_size: int | None = None,
-        model_path: str | Path | None = None,
-        hf_repo: str | None = None,
-        hf_filename: str | None = None,
-        hf_revision: str | None = None,
-    ):
-        _validate_conf_limit(conf_limit)
-        _validate_batch_size(batch_size)
-        self.conf_limit = conf_limit
-        self.batch_size = batch_size
-        # Build the transform before resolving weights: a config typo fails before a download.
-        self.transform = build_transform(preprocessing)
-        weights = resolve_weights(model_path, hf_repo, hf_filename, hf_revision)
-        self.model = self._load_model(weights)
-
-    @classmethod
-    def from_config(cls, path: str | Path) -> Self:
-        """Build a model from a YAML file whose top-level keys are the constructor arguments.
-
-        Args:
-            path: The config file.
-
-        Returns:
-            The model.
-
-        Raises:
-            TypeError: The file's top level is not a mapping, or it has missing/unknown keys.
-        """
-        with open(path) as file:
-            config = yaml.safe_load(file)
-        if not isinstance(config, Mapping):
-            raise TypeError(f"config {path} must contain a mapping at the top level")
-        return cls(**config)
-
-    def predict(self, image_paths: list[str | Path]) -> tuple[list[torch.Tensor], list[list[T]]]:
-        """Run the model on images.
-
-        Args:
-            image_paths: Image files.
-
-        Returns:
-            `(probabilities, payload)`, one entry per image in input order, all tensors on CPU.
-            Detectors: 1-D tensor of kept box scores and the `BoundingBox` list in the same
-            (descending) order. Classifiers: the full probability vector and the
-            `Classification` list of classes with probability >= `conf_limit`, descending.
-
-        Raises:
-            TypeError: `image_paths` is a single path instead of a list, or the preprocessing
-                produced inputs the backend cannot take.
-            FileNotFoundError: An image does not exist.
-            ValueError: The model's output breaks its contract, or images cannot be batched.
-        """
-        if isinstance(image_paths, (str, Path)):
-            raise TypeError("predict takes a list of image paths, not a single path")
-        if len(image_paths) == 0:
-            return [], []
-        chunk_size = len(image_paths) if self.batch_size is None else self.batch_size
-        results: list[tuple[torch.Tensor, list[T]]] = []
-        for start in range(0, len(image_paths), chunk_size):
-            chunk = image_paths[start : start + chunk_size]
-            inputs = [self._preprocess(load_image(path)) for path in chunk]
-            results.extend(self._infer(inputs, [str(path) for path in chunk]))
-        return [tensor for tensor, _ in results], [items for _, items in results]
-
-    def _preprocess(self, image: Image.Image) -> Any:
-        """Apply the configured transforms to one loaded image."""
-        return self.transform(image)
-
-    @abstractmethod
-    def _load_model(self, weights: str | Path) -> Any:
-        """Load the backend model from the resolved weights location."""
-
-    @abstractmethod
-    def _infer(self, inputs: list[Any], paths: list[str]) -> list[tuple[torch.Tensor, list[T]]]:
-        """Run one batch of preprocessed images; return one (CPU tensor, payload) pair per image."""
-
-
 def _validate_conf_limit(conf_limit: Any) -> None:
     """Reject non-numeric confidence limits and values outside [0, 1] (including NaN)."""
     if isinstance(conf_limit, bool) or not isinstance(conf_limit, (int, float)):
@@ -283,39 +159,193 @@ def _validate_conf_limit(conf_limit: Any) -> None:
         raise ValueError(f"conf_limit must be in [0, 1], got {conf_limit}")
 
 
-def _validate_batch_size(batch_size: Any) -> None:
-    """Accept None or an int >= 1; bool is rejected explicitly because `True >= 1` holds."""
-    if batch_size is None:
-        return
-    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
-        raise TypeError(f"batch_size must be an int or None, got {batch_size!r}")
-    if batch_size < 1:
-        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+def _validated_info(info: Any) -> ModelInfo:
+    """Validate a model's `info`; misspelled keys are errors, not silently dropped.
+
+    The check is done here rather than with `extra="forbid"` on `ModelInfo`, so the API schema
+    stays unchanged.
+    """
+    if isinstance(info, Mapping):
+        unknown = sorted(set(info) - set(ModelInfo.model_fields), key=str)  # YAML keys may be non-strings
+        if unknown:
+            raise ValueError(f"unknown info keys {unknown}; allowed: {list(ModelInfo.model_fields)}")
+    return ModelInfo.model_validate(info)
 
 
-class DetectorBase(ModelBase[BoundingBox]):
-    """Class-agnostic detectors: `predict` returns box scores and `BoundingBox` lists."""
+def _validated_label_map(label_map: Any) -> dict[str, str]:
+    """Check a `label_map` node: a mapping of non-empty label strings; `None` means no renaming."""
+    if label_map is None:
+        return {}
+    if not isinstance(label_map, Mapping):
+        raise TypeError(f"label_map must be a mapping of model labels to output labels, got {label_map!r}")
+    for source, target in label_map.items():
+        if not isinstance(source, str) or not isinstance(target, str):
+            raise TypeError(f"label_map entries must map strings to strings, got {source!r}: {target!r}")
+        if source == "" or target == "":
+            raise ValueError(f"label_map entries must not be empty strings, got {source!r}: {target!r}")
+    return dict(label_map)
 
-    def _make_boxes(self, xyxy: torch.Tensor, scores: torch.Tensor) -> tuple[torch.Tensor, list[BoundingBox]]:
-        """Keep boxes with score >= conf_limit and sort them by descending score.
+
+def _validated_labels(labels: Any) -> tuple[str, ...]:
+    """Check a torch detector's `labels`: a non-empty sequence of unique, non-empty strings."""
+    if isinstance(labels, str) or not isinstance(labels, Sequence):
+        raise TypeError(f"labels must be a list of label strings, got {labels!r}")
+    if not all(isinstance(label, str) for label in labels):
+        raise TypeError(f"labels must be strings, got {labels!r}")
+    if len(labels) == 0:
+        raise ValueError("labels must name at least one class")
+    if any(label == "" for label in labels):
+        raise ValueError(f"labels must not be empty strings, got {labels!r}")
+    if len(set(labels)) != len(labels):
+        raise ValueError(f"labels must be unique, got {labels!r}")
+    return tuple(labels)
+
+
+def _outside_unit_interval(values: torch.Tensor) -> torch.Tensor:
+    """Elementwise test for values outside [0, 1]; NaN counts as outside."""
+    return ~((values >= 0) & (values <= 1))
+
+
+# --------------------------------------------------------------------- base classes
+
+
+class ModelBase[T](ABC):
+    """Common construction and `predict` flow of all models.
+
+    Subclasses implement `_load_model` (backend loading) and `_infer` (one preprocessed image to
+    its result). Subclasses with extra arguments validate them before calling `super().__init__`,
+    so configuration errors surface before any download.
+
+    Args:
+        info: Name, version and description of the model (a `ModelInfo` or its mapping).
+        preprocessing: torchvision v2 transforms, see `build_transform`. Required; may be empty.
+        conf_limit: Minimum confidence in [0, 1] of returned boxes / classes.
+        model_path: Local weights or backend identifier.
+        hf_repo: Hugging Face Hub repository with the weights (instead of `model_path`).
+        hf_filename: File in `hf_repo`.
+        hf_revision: Optional revision of `hf_repo`.
+
+    Raises:
+        TypeError: An argument has the wrong type.
+        ValueError: An argument has an invalid value (including an invalid `info`).
+    """
+
+    DEVICE = "cpu"  # all inference runs on CPU: the inference server has no GPU
+
+    def __init__(
+        self,
+        *,
+        info: ModelInfo | Mapping[str, Any],
+        preprocessing: Mapping[str, Mapping[str, Any]] | None,
+        conf_limit: float,
+        model_path: str | Path | None = None,
+        hf_repo: str | None = None,
+        hf_filename: str | None = None,
+        hf_revision: str | None = None,
+    ):
+        self.info = _validated_info(info)
+        _validate_conf_limit(conf_limit)
+        self.conf_limit = conf_limit
+        # Build the transform before resolving weights: a config typo fails before a download.
+        self.transform = build_transform(preprocessing)
+        weights = resolve_weights(model_path, hf_repo, hf_filename, hf_revision)
+        self.model = self._load_model(weights)
+
+    def predict(self, image: Image.Image) -> tuple[torch.Tensor, list[T]]:
+        """Run the model on one image.
+
+        Args:
+            image: An RGB PIL image.
+
+        Returns:
+            `(probabilities, payload)` with CPU tensors. Detectors: 1-D tensor of the kept box
+            scores and the `Detection` list in the same (descending) order. Classifiers: the full
+            probability vector and the `Classification` list of classes with probability
+            >= `conf_limit`, descending.
+
+        Raises:
+            TypeError: `image` is not a PIL image, or the preprocessing produced inputs the
+                backend cannot take.
+            ValueError: `image` is not RGB, or the model's output breaks its contract.
+        """
+        if not isinstance(image, Image.Image):
+            raise TypeError(f"predict takes one PIL image, got {type(image).__name__}")
+        if image.mode != "RGB":
+            raise ValueError(f"predict takes RGB images, got mode {image.mode!r}")
+        return self._infer(self._preprocess(image))
+
+    def _preprocess(self, image: Image.Image) -> Any:
+        """Apply the configured transforms to the image."""
+        return self.transform(image)
+
+    @abstractmethod
+    def _load_model(self, weights: str | Path) -> Any:
+        """Load the backend model from the resolved weights location."""
+
+    @abstractmethod
+    def _infer(self, preprocessed: Any) -> tuple[torch.Tensor, list[T]]:
+        """Run the model on one preprocessed image; return its (CPU tensor, payload) pair."""
+
+
+class DetectorBase(ModelBase[Detection]):
+    """Detectors: `predict` returns box scores and labelled, not yet classified `Detection`s.
+
+    Args:
+        label_map: Optional renaming of model labels (e.g. `{"cat": "animal"}`); its keys must be
+            labels the model can emit. Unmapped labels are returned verbatim.
+        **kwargs: See `ModelBase`.
+
+    Raises:
+        TypeError: `label_map` is not a mapping of strings to strings.
+        ValueError: `label_map` has empty strings or keys the loaded model does not emit.
+    """
+
+    def __init__(self, *, label_map: Mapping[str, str] | None = None, **kwargs):
+        self.label_map = _validated_label_map(label_map)
+        super().__init__(**kwargs)
+        # Checked after loading, because YOLO's label set comes from the weights.
+        unknown = sorted(set(self.label_map) - set(self.labels))
+        if unknown:
+            raise ValueError(f"label_map keys {unknown} are not labels of this model, which emits {list(self.labels)}")
+
+    @property
+    @abstractmethod
+    def labels(self) -> tuple[str, ...]:
+        """The labels the loaded model can emit (before `label_map`)."""
+
+    def _make_detections(
+        self, xyxy: torch.Tensor, scores: torch.Tensor, labels: Sequence[str]
+    ) -> tuple[torch.Tensor, list[Detection]]:
+        """Keep boxes with score >= conf_limit, sort them by descending score and label them.
 
         Args:
             xyxy: `[K, 4]` relative box corners on CPU.
             scores: `[K]` box scores on CPU.
+            labels: K model labels, before `label_map`.
 
         Returns:
-            The kept scores and their `BoundingBox`es, in the same order.
+            The kept scores and their `Detection`s (empty `classifications`), in the same order.
         """
-        keep = scores >= self.conf_limit
-        xyxy, scores = xyxy[keep], scores[keep]
+        kept = torch.nonzero(scores >= self.conf_limit).flatten()
         # stable sort: equal scores keep the backend's order, so results are deterministic
-        order = torch.argsort(scores, descending=True, stable=True)
-        xyxy, scores = xyxy[order], scores[order]
-        boxes = [
-            BoundingBox(x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max)
-            for x_min, y_min, x_max, y_max in xyxy.tolist()
+        kept = kept[torch.argsort(scores[kept], descending=True, stable=True)]
+        detections = [
+            Detection(
+                detected_class=self._output_label(labels[index]),
+                confidence=float(scores[index]),
+                bbox=BoundingBox(x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max),
+            )
+            for index, (x_min, y_min, x_max, y_max) in zip(kept.tolist(), xyxy[kept].tolist())
         ]
-        return scores, boxes
+        # clone: callers get an ordinary tensor even if the backend computed in inference mode
+        return scores[kept].clone(), detections
+
+    def _output_label(self, label: str) -> str:
+        """Apply `label_map` to one model label."""
+        if label in self.label_map:
+            return self.label_map[label]
+        else:
+            return label
 
 
 class ClassifierBase(ModelBase[Classification]):
@@ -326,10 +356,15 @@ class ClassifierBase(ModelBase[Classification]):
         **kwargs: See `ModelBase`.
 
     Raises:
-        ValueError: A taxonomy entry is invalid (e.g. no genus).
+        TypeError: `classes` is not a list.
+        ValueError: `classes` is empty or a taxonomy entry is invalid (e.g. no genus).
     """
 
     def __init__(self, *, classes: Sequence[Mapping[str, Any]], **kwargs):
+        if isinstance(classes, (str, Mapping)) or not isinstance(classes, Sequence):
+            raise TypeError(f"classes must be a list of taxonomy entries, got {classes!r}")
+        if len(classes) == 0:
+            raise ValueError("classes must have one taxonomy entry per model output")
         self.classes = [Taxon.model_validate(entry) for entry in classes]
         self._taxon_fields = [taxon.model_dump() for taxon in self.classes]
         super().__init__(**kwargs)
@@ -362,35 +397,48 @@ class _UltralyticsMixin:
 
         Raises:
             FileNotFoundError: The path does not exist and is no ultralytics asset name.
+            ValueError: The weights are for another task (e.g. classifier weights for a detector).
         """
         path = Path(weights)
         # Without this check ultralytics would query the GitHub API (30 s timeout) before failing.
         if not path.exists() and path.name not in GITHUB_ASSETS_NAMES:
             raise FileNotFoundError(f"YOLO weights not found: {weights}")
-        return YOLO(str(weights), task=self.task)
+        model = YOLO(str(weights), task=self.task)
+        # ultralytics takes the task from the checkpoint, ignoring `task=`; a mismatch would only
+        # fail later, on every predict call
+        if model.task != self.task:
+            raise ValueError(f"{weights} is a YOLO '{model.task}' model; {type(self).__name__} needs '{self.task}'")
+        return model
 
-    def _run_yolo(self, inputs: list[Any], **predict_kwargs) -> list[Any]:
-        """Run ultralytics on one batch of PIL images (it letterboxes and normalises itself)."""
-        images = [ensure_pil(image) for image in inputs]
-        return self.model.predict(source=images, device=self.DEVICE, verbose=False, **predict_kwargs)
+    def _run_yolo(self, preprocessed: Any, **predict_kwargs) -> Any:
+        """Run ultralytics on one PIL image (it letterboxes and normalises itself); return its result."""
+        image = ensure_pil(preprocessed)
+        return self.model.predict(source=image, device=self.DEVICE, verbose=False, **predict_kwargs)[0]
 
 
 class YoloDetector(_UltralyticsMixin, DetectorBase):
-    """Ultralytics YOLO detector. All boxes are kept regardless of their class; labels are dropped.
+    """Ultralytics YOLO detector. All boxes are kept and labelled with the model's class names.
 
-    `model_path` may be an ultralytics asset name such as `yolo26n.pt`: if the file does not
-    exist, ultralytics downloads the pretrained weights to that path. A mistyped path ending in
-    an asset name therefore downloads the stock weights. Ultralytics keeps at most 300 boxes
+    Boxes are relative to the preprocessed image, so they match the original image only if
+    preprocessing does not crop, pad or flip. `model_path` may be an ultralytics asset name such
+    as `yolo26n.pt`: if the file does not exist, ultralytics downloads the pretrained weights to
+    that path. A mistyped path ending in an asset name therefore downloads the stock weights. Ultralytics keeps at most 300 boxes
     per image (`max_det` default) and drops boxes whose score equals `conf_limit` exactly (it
-    filters with `>`). See `ModelBase` for the arguments.
+    filters with `>`). See `DetectorBase` / `ModelBase` for the arguments.
     """
 
     task = "detect"
 
-    def _infer(self, inputs: list[Any], paths: list[str]) -> list[tuple[torch.Tensor, list[BoundingBox]]]:
-        """Detect boxes in one batch of PIL images."""
-        results = self._run_yolo(inputs, conf=self.conf_limit)
-        return [self._make_boxes(r.boxes.xyxyn.cpu(), r.boxes.conf.cpu()) for r in results]
+    @property
+    def labels(self) -> tuple[str, ...]:
+        """The class names stored in the YOLO weights."""
+        return tuple(self.model.names.values())
+
+    def _infer(self, preprocessed: Any) -> tuple[torch.Tensor, list[Detection]]:
+        """Detect and label boxes in one PIL image."""
+        boxes = self._run_yolo(preprocessed, conf=self.conf_limit).boxes
+        labels = [self.model.names[int(class_index)] for class_index in boxes.cls.tolist()]
+        return self._make_detections(boxes.xyxyn.cpu(), boxes.conf.cpu(), labels)
 
 
 class YoloClassifier(_UltralyticsMixin, ClassifierBase):
@@ -409,32 +457,28 @@ class YoloClassifier(_UltralyticsMixin, ClassifierBase):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         if len(self.classes) != len(self.model.names):
-            raise ValueError(
-                f"{len(self.classes)} taxonomy entries for a model with {len(self.model.names)} classes"
-            )
+            raise ValueError(f"{len(self.classes)} taxonomy entries for a model with {len(self.model.names)} classes")
 
-    def _infer(self, inputs: list[Any], paths: list[str]) -> list[tuple[torch.Tensor, list[Classification]]]:
-        """Classify one batch of PIL images."""
-        results = self._run_yolo(inputs)
-        # clone: ultralytics computes under inference mode; callers get ordinary tensors
-        probabilities = [r.probs.data.cpu().float().clone() for r in results]
-        return [(probs, self._make_classifications(probs)) for probs in probabilities]
+    def _infer(self, preprocessed: Any) -> tuple[torch.Tensor, list[Classification]]:
+        """Classify one PIL image."""
+        # clone: ultralytics computes under inference mode; callers get an ordinary tensor
+        probabilities = self._run_yolo(preprocessed).probs.data.cpu().float().clone()
+        return probabilities, self._make_classifications(probabilities)
 
 
 # -------------------------------------------------------------------------- torch
 
 
 class _TorchModelMixin:
-    """Shared loading and calling of plain `.pt` torch modules (see the contract in the plan, 3.4).
+    """Shared loading and calling of plain `.pt` torch modules.
 
     The file format and its trust requirements are documented on `TorchClassifier` and
     `TorchDetector`.
 
-    Model input: a float32 `[B, 3, H, W]` CPU tensor; each image is converted with
+    Model input: a float32 `[1, 3, H, W]` CPU tensor; the image is converted with
     `ToImage + ToDtype(float32, scale=True)` (values in [0, 1]) and then passed through the
-    configured transforms, so all images must end up the same size (configure a resize).
-    `1 <= B <= batch_size`, or all images of the `predict` call without `batch_size`. The
-    module is in eval mode and runs under `torch.inference_mode()`.
+    configured transforms. The leading batch dimension keeps modules ready for later batching.
+    The module is in eval mode and runs under `torch.inference_mode()`.
     """
 
     def _load_model(self, weights: str | Path) -> torch.nn.Module:
@@ -462,49 +506,37 @@ class _TorchModelMixin:
         tensor = tv_functional.to_dtype(tv_functional.to_image(image), torch.float32, scale=True)
         return self.transform(tensor)
 
-    def _forward(self, inputs: list[torch.Tensor]) -> Any:
-        """Stack one batch and run the module on it.
+    def _forward(self, preprocessed: Any) -> Any:
+        """Run the module on one preprocessed image, as a batch of one.
 
         Raises:
-            TypeError: The configured preprocessing did not produce tensors.
-            ValueError: The preprocessed images differ in size.
+            TypeError: The configured preprocessing did not produce a tensor.
         """
-        if not all(isinstance(tensor, torch.Tensor) for tensor in inputs):
+        if not isinstance(preprocessed, torch.Tensor):
             raise TypeError("torch models need tensors; preprocessing must not convert them back (e.g. to_pil_image)")
-        shapes = {tuple(tensor.shape) for tensor in inputs}
-        if len(shapes) != 1:
-            raise ValueError(
-                f"preprocessed images differ in size {sorted(shapes)}; add a resize to the preprocessing node"
-            )
-        # as_subclass strips torchvision's tv_tensors.Image wrapper: the module gets plain tensors
-        batch = torch.stack([tensor.as_subclass(torch.Tensor) for tensor in inputs])
+        # as_subclass strips torchvision's tv_tensors.Image wrapper: the module gets a plain tensor
+        batch = preprocessed.as_subclass(torch.Tensor).unsqueeze(0)
         with torch.inference_mode():
             return self.model(batch)
 
     @staticmethod
-    def _check_shape(output: Any, batch_size: int, rank: int, last_dim: int, expected: str) -> None:
+    def _check_shape(output: Any, rank: int, last_dim: int, expected: str) -> None:
         """Raise ValueError naming the `expected` output unless `output` is one tensor of that shape.
 
         Args:
             output: What the module returned.
-            batch_size: B of the input batch; the output's first dimension.
-            rank: Required number of dimensions.
+            rank: Required number of dimensions; the first one must be the batch of one.
             last_dim: Required size of the last dimension.
             expected: Human-readable description of the contract, for the error message.
         """
         if not isinstance(output, torch.Tensor):
             raise ValueError(f"model must return {expected}, got {type(output).__name__}")
-        if output.ndim != rank or output.shape[0] != batch_size or output.shape[-1] != last_dim:
+        if output.ndim != rank or output.shape[0] != 1 or output.shape[-1] != last_dim:
             raise ValueError(f"model must return {expected}, got shape {tuple(output.shape)}")
 
 
-def _outside_unit_interval(values: torch.Tensor) -> torch.Tensor:
-    """Elementwise test for values outside [0, 1]; NaN counts as outside."""
-    return ~((values >= 0) & (values <= 1))
-
-
 class TorchClassifier(_TorchModelMixin, ClassifierBase):
-    """Classifier from a pickled torch module that returns a single `[B, C]` tensor.
+    """Classifier from a pickled torch module that returns a single `[1, C]` tensor.
 
     Column i of the output corresponds to `classes[i]`.
 
@@ -514,7 +546,7 @@ class TorchClassifier(_TorchModelMixin, ClassifierBase):
 
     Args:
         apply_softmax: True if the module returns logits, False if it returns probabilities
-            (rows in [0, 1] summing to 1).
+            (values in [0, 1] summing to 1).
         **kwargs: See `ClassifierBase` / `ModelBase`.
 
     Raises:
@@ -527,116 +559,143 @@ class TorchClassifier(_TorchModelMixin, ClassifierBase):
         self.apply_softmax = apply_softmax
         super().__init__(**kwargs)
 
-    def _infer(self, inputs: list[torch.Tensor], paths: list[str]) -> list[tuple[torch.Tensor, list[Classification]]]:
-        """Classify one batch of preprocessed tensors."""
-        output = self._forward(inputs)
-        self._check_output(output, len(inputs))
+    def _infer(self, preprocessed: torch.Tensor) -> tuple[torch.Tensor, list[Classification]]:
+        """Classify one preprocessed tensor."""
+        output = self._forward(preprocessed)
+        self._check_output(output)
         if self.apply_softmax:
             probabilities = torch.softmax(output.float(), dim=1)
         else:
             probabilities = output.float()
-        # clone: the output was computed under inference mode; callers get ordinary tensors
-        rows = probabilities.cpu().clone()
-        return [(row, self._make_classifications(row)) for row in rows]
+        # clone: the output was computed under inference mode; callers get an ordinary tensor
+        row = probabilities[0].cpu().clone()
+        return row, self._make_classifications(row)
 
-    def _check_output(self, output: Any, batch_size: int) -> None:
+    def _check_output(self, output: Any) -> None:
         """Raise ValueError naming the expected output if the module broke the contract."""
-        expected = f"a single tensor [B={batch_size}, C={len(self.classes)}]"
-        self._check_shape(output, batch_size, rank=2, last_dim=len(self.classes), expected=expected)
+        expected = f"a single tensor [1, C={len(self.classes)}]"
+        self._check_shape(output, rank=2, last_dim=len(self.classes), expected=expected)
         if self.apply_softmax:
             if not torch.isfinite(output).all():
                 raise ValueError("classifier logits (apply_softmax: true) must be finite")
         else:
             if _outside_unit_interval(output).any():
                 raise ValueError("classifier probabilities (apply_softmax: false) must lie in [0, 1]")
-            if not torch.allclose(output.float().sum(dim=1), torch.ones(batch_size), atol=1e-4):
-                raise ValueError("classifier probabilities (apply_softmax: false) must sum to 1 per image")
+            if not torch.allclose(output.float().sum(dim=1), torch.ones(1), atol=1e-4):
+                raise ValueError("classifier probabilities (apply_softmax: false) must sum to 1")
 
 
 class TorchDetector(_TorchModelMixin, DetectorBase):
-    """Detector from a pickled torch module that returns a single `[B, K, 5]` tensor.
+    """Detector from a pickled torch module that returns a single `[1, K, 6]` tensor.
 
-    Each row is `(x1, y1, x2, y2, score)`, with corners relative (0-1) to the model input
-    tensor; they are passed through unchanged, so they are relative to the original image
-    only if preprocessing does not crop, pad or flip. K may vary between calls. Rows with
-    score 0 are padding and are always dropped. See `ModelBase` for the arguments.
+    Each row is `(x1, y1, x2, y2, score, class_index)`, with corners relative (0-1) to the model
+    input tensor; they are passed through unchanged, so they are relative to the original image
+    only if preprocessing does not crop, pad or flip. `class_index` is an integer value indexing
+    `labels`. K may vary between calls. Rows with score 0 are padding and are always dropped.
 
     The `.pt` file must hold a whole pickled module (`torch.save(model)`), loaded with
     `weights_only=False`: unpickling can run arbitrary code, so load trusted files only, and
     the package defining the module class must be importable here.
+
+    Args:
+        labels: The label of each class index, in order.
+        **kwargs: See `DetectorBase` / `ModelBase`.
+
+    Raises:
+        TypeError: `labels` is not a list of strings.
+        ValueError: `labels` is empty or has empty or duplicate entries.
     """
 
-    def _infer(self, inputs: list[torch.Tensor], paths: list[str]) -> list[tuple[torch.Tensor, list[BoundingBox]]]:
-        """Detect boxes in one batch of preprocessed tensors."""
-        output = self._forward(inputs)
-        self._check_output(output, len(inputs))
-        output = output.float().cpu()
-        # Mask computed once: padding (score 0) and rows below conf_limit are dropped here,
-        # and only kept rows must carry valid boxes.
-        kept = (output[..., 4] > 0) & (output[..., 4] >= self.conf_limit)
-        self._check_kept_boxes(output[kept][:, :4])
-        return [self._make_boxes(rows[mask, :4], rows[mask, 4]) for rows, mask in zip(output, kept)]
+    def __init__(self, *, labels: Sequence[str], **kwargs):
+        self._labels = _validated_labels(labels)
+        super().__init__(**kwargs)
 
-    def _check_output(self, output: Any, batch_size: int) -> None:
+    @property
+    def labels(self) -> tuple[str, ...]:
+        """The configured labels, indexed by the output's class column."""
+        return self._labels
+
+    def _infer(self, preprocessed: torch.Tensor) -> tuple[torch.Tensor, list[Detection]]:
+        """Detect and label boxes in one preprocessed tensor."""
+        output = self._forward(preprocessed)
+        self._check_output(output)
+        rows = output[0].float().cpu().clone()
+        # Mask computed once: padding (score 0) and rows below conf_limit are dropped here, and
+        # only kept rows must carry valid boxes and class indices.
+        kept = rows[(rows[:, 4] > 0) & (rows[:, 4] >= self.conf_limit)]
+        self._check_kept_rows(kept)
+        labels = [self._labels[int(class_index)] for class_index in kept[:, 5].tolist()]
+        return self._make_detections(kept[:, :4], kept[:, 4], labels)
+
+    def _check_output(self, output: Any) -> None:
         """Raise ValueError naming the expected output if the module broke the contract."""
-        expected = f"a single tensor [B={batch_size}, K, 5] of (x1, y1, x2, y2, score)"
-        self._check_shape(output, batch_size, rank=3, last_dim=5, expected=expected)
+        expected = "a single tensor [1, K, 6] of (x1, y1, x2, y2, score, class_index)"
+        self._check_shape(output, rank=3, last_dim=6, expected=expected)
         if _outside_unit_interval(output[..., 4]).any():
             raise ValueError("detector scores must lie in [0, 1]")
 
-    @staticmethod
-    def _check_kept_boxes(xyxy: torch.Tensor) -> None:
-        """Raise ValueError for kept boxes outside [0, 1] or with inverted corners."""
+    def _check_kept_rows(self, rows: torch.Tensor) -> None:
+        """Raise ValueError for kept rows with invalid boxes or class indices."""
+        xyxy, class_index = rows[:, :4], rows[:, 5]
         if _outside_unit_interval(xyxy).any():
             raise ValueError("detector box corners must lie in [0, 1] (relative coordinates)")
         if (xyxy[:, 0] > xyxy[:, 2]).any() or (xyxy[:, 1] > xyxy[:, 3]).any():
             raise ValueError("detector boxes must have x1 <= x2 and y1 <= y2")
+        # NaN fails the integer test, so it is rejected, too
+        invalid = (class_index != torch.round(class_index)) | (class_index < 0) | (class_index >= len(self._labels))
+        if invalid.any():
+            raise ValueError(f"detector class indices must be integers in [0, {len(self._labels)})")
 
 
 # --------------------------------------------------------------------- SpeciesNet
 
 
 class SpeciesnetDetector(DetectorBase):
-    """SpeciesNet's detector component (MegaDetector), returning only its `animal` boxes, unlabelled.
+    """SpeciesNet's detector component (MegaDetector), returning all boxes with their SDK label.
 
-    SpeciesNet preprocesses images itself (letterbox to 1280), so `preprocessing` must be
-    present but empty. It processes one image per SDK call, so `batch_size` may only be
-    `None` or 1. The SDK drops boxes below 0.01, so `conf_limit` must be >= 0.01.
+    Labels are `animal`, `human` and `vehicle`. SpeciesNet preprocesses images itself
+    (letterbox to 1280), so `preprocessing` must be present but empty. The SDK drops boxes
+    below 0.01, so `conf_limit` must be >= 0.01.
 
     Kaggle models are downloaded and cached by the SDK (`kagglehub`). If the model's `info.json`
     lists the detector weights as a URL (as v4.0.3b does: MegaDetector v5a on GitHub), the SDK
-    also downloads that file with `requests` on first use.
+    also downloads that file with `requests` on first use. Importing the SDK makes Pillow load
+    truncated images process-wide (`PIL.ImageFile.LOAD_TRUNCATED_IMAGES = True`).
 
     Args:
+        info: See `ModelBase`.
         model_path: Local SpeciesNet model folder (with `info.json`) or a `kaggle:` id; Kaggle
             models are downloaded and cached by the SDK. Defaults to SpeciesNet v4.0.3b.
         preprocessing: Must be empty (`{}` or `None`).
         conf_limit: Minimum box score, in [0.01, 1].
-        batch_size: `None` or 1.
         hf_repo: Not supported: SpeciesNet is not published on the Hugging Face Hub.
         hf_filename: Only valid with `hf_repo`.
         hf_revision: Only valid with `hf_repo`.
+        label_map: See `DetectorBase`; keys must be in `LABELS`.
 
     Raises:
         NotImplementedError: `hf_repo` was given.
         TypeError: `preprocessing` is not a mapping, or `conf_limit` is not a number.
-        ValueError: Non-empty preprocessing, `batch_size` other than None/1, or `conf_limit` < 0.01.
+        ValueError: Non-empty preprocessing, or `conf_limit` < 0.01.
     """
 
     DEFAULT_MODEL_PATH = "kaggle:google/speciesnet/pyTorch/v4.0.3b/1"
-    KEPT_LABEL = "animal"
+    LABELS = ("animal", "human", "vehicle")  # speciesnet.constants.Detection
     MIN_CONF_LIMIT = 0.01  # the SDK's fixed DETECTION_THRESHOLD
+    # The SDK's predict only echoes its filepath into the result; models never see paths.
+    SDK_FILEPATH_PLACEHOLDER = "<in-memory image>"
 
     def __init__(
         self,
         *,
+        info: ModelInfo | Mapping[str, Any],
         preprocessing: Mapping[str, Mapping[str, Any]] | None,
         conf_limit: float,
-        batch_size: int | None = None,
         model_path: str | Path = DEFAULT_MODEL_PATH,
         hf_repo: str | None = None,
         hf_filename: str | None = None,
         hf_revision: str | None = None,
+        label_map: Mapping[str, str] | None = None,
     ):
         if hf_repo is not None:
             raise NotImplementedError(
@@ -647,19 +706,23 @@ class SpeciesnetDetector(DetectorBase):
             raise TypeError(f"preprocessing must be a mapping of transform names to kwargs, got {preprocessing!r}")
         if preprocessing is not None and len(preprocessing) != 0:
             raise ValueError("SpeciesNet preprocesses images itself; its preprocessing node must be empty")
-        if batch_size is not None and batch_size != 1:
-            raise ValueError("SpeciesNet processes one image per call; batch_size must be omitted or 1")
         _validate_conf_limit(conf_limit)  # type check first, so the comparison below is safe
         if conf_limit < self.MIN_CONF_LIMIT:
             raise ValueError(f"SpeciesNet drops boxes below {self.MIN_CONF_LIMIT}; conf_limit must be >= that")
         super().__init__(
+            info=info,
             preprocessing=preprocessing,
             conf_limit=conf_limit,
-            batch_size=batch_size,
             model_path=model_path,
             hf_filename=hf_filename,
             hf_revision=hf_revision,
+            label_map=label_map,
         )
+
+    @property
+    def labels(self) -> tuple[str, ...]:
+        """SpeciesNet's fixed detector labels."""
+        return self.LABELS
 
     def _load_model(self, weights: str | Path) -> SpeciesNetDetector:
         """Load the SDK detector and force it onto the CPU."""
@@ -671,19 +734,65 @@ class SpeciesnetDetector(DetectorBase):
         detector.model.to(self.DEVICE)
         return detector
 
-    def _infer(self, inputs: list[Image.Image], paths: list[str]) -> list[tuple[torch.Tensor, list[BoundingBox]]]:
-        """Detect boxes image by image (the SDK has no batch API for its detector component)."""
-        return [self._detect(image, path) for image, path in zip(inputs, paths)]
-
-    def _detect(self, image: Image.Image, path: str) -> tuple[torch.Tensor, list[BoundingBox]]:
-        """Run the SDK on one image and keep its animal boxes as relative xyxy corners."""
-        # load_image always yields an image, so `preprocess` never returns None here and the
+    def _infer(self, preprocessed: Image.Image) -> tuple[torch.Tensor, list[Detection]]:
+        """Run the SDK on one image and convert its boxes to relative xyxy corners."""
+        # `predict` only accepts RGB PIL images, so `preprocess` never returns None here and the
         # SDK's "failures" result (which has no "detections") cannot occur.
-        prediction = self.model.predict(path, self.model.preprocess(image))
-        animals = [d for d in prediction["detections"] if d["label"] == self.KEPT_LABEL]
+        prediction = self.model.predict(self.SDK_FILEPATH_PLACEHOLDER, self.model.preprocess(preprocessed))
+        detections = prediction["detections"]
         xyxy = torch.tensor(
-            [[x, y, x + width, y + height] for x, y, width, height in (d["bbox"] for d in animals)],
+            [[x, y, x + width, y + height] for x, y, width, height in (d["bbox"] for d in detections)],
             dtype=torch.float32,
         ).reshape(-1, 4)
-        scores = torch.tensor([d["conf"] for d in animals], dtype=torch.float32)
-        return self._make_boxes(xyxy, scores)
+        scores = torch.tensor([d["conf"] for d in detections], dtype=torch.float32)
+        return self._make_detections(xyxy, scores, [d["label"] for d in detections])
+
+
+# ---------------------------------------------------------------------- config files
+
+
+def load_model(path: str | Path) -> ModelBase:
+    """Build a model from a YAML config file.
+
+    The required `type` key names the model class; all other keys are its constructor arguments,
+    so missing required keys and unknown keys raise.
+
+    Args:
+        path: The config file.
+
+    Returns:
+        The model.
+
+    Raises:
+        FileNotFoundError: The config file does not exist.
+        yaml.YAMLError: The file is not valid YAML.
+        TypeError: The file's top level is not a mapping, or it has missing/unknown keys.
+        ValueError: `type` is missing or names no model class, or an argument is invalid.
+    """
+    with open(path) as file:
+        config = yaml.safe_load(file)
+    if not isinstance(config, Mapping):
+        raise TypeError(f"config {path} must contain a mapping at the top level")
+    kwargs = dict(config)
+    model_class = _model_class(kwargs.pop("type", None))
+    return model_class(**kwargs)
+
+
+def _model_class(model_type: Any) -> type[ModelBase]:
+    """Map a config's `type` value to its model class."""
+    match model_type:
+        case "YoloDetector":
+            return YoloDetector
+        case "SpeciesnetDetector":
+            return SpeciesnetDetector
+        case "TorchDetector":
+            return TorchDetector
+        case "YoloClassifier":
+            return YoloClassifier
+        case "TorchClassifier":
+            return TorchClassifier
+        case _:
+            raise ValueError(
+                "config key `type` must be one of YoloDetector, SpeciesnetDetector, TorchDetector, "
+                f"YoloClassifier, TorchClassifier; got {model_type!r}"
+            )

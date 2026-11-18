@@ -1,38 +1,53 @@
-"""Species classification service."""
+"""Species classification service: runs the configured classifier on one crop."""
 
-from ml_pipeline.schemas.analysis import Classification, Detection, ModelInfo
+import functools
 
-CLASSIFICATION_MODEL = ModelInfo(
-    name="rodent-classifier",
-    version="0.1",
-    description="Simulated rodent species classifier",
-)
+from PIL import Image
 
-_MURIDAE = {
-    "kingdom": "Animalia",
-    "phylum": "Chordata",
-    "class_name": "Mammalia",
-    "order": "Rodentia",
-    "family": "Muridae",
-}
+from ml_pipeline.config import settings
+from ml_pipeline.models.model import ClassifierBase, load_model
+from ml_pipeline.schemas.analysis import Classification, ModelInfo
 
 
-def classify_species(image_path: str, detection: Detection) -> list[Classification]:
-    """Return species candidates for one detected animal, most likely first."""
-    # TODO: replace with real classification model
-    return [
-        Classification(
-            **_MURIDAE,
-            genus="Rattus",
-            species="rattus",
-            common_name="black rat",
-            confidence=0.87,
-        ),
-        Classification(
-            **_MURIDAE,
-            genus="Rattus",
-            species="norvegicus",
-            common_name="brown rat",
-            confidence=0.1,
-        ),
-    ]
+def classify_species(crop: Image.Image) -> list[Classification]:
+    """Classify the species of one detected animal.
+
+    Args:
+        crop: The RGB image region of the detection.
+
+    Returns:
+        Species candidates above the classifier's confidence limit, most likely first.
+
+    Raises:
+        RuntimeError: No classifier is configured (`CLASSIFIER_CONFIG` is unset).
+        TypeError: `CLASSIFIER_CONFIG` configures a model that is not a classifier.
+    """
+    _, classifications = _classifier().predict(crop)
+    return classifications
+
+
+def classification_model() -> ModelInfo:
+    """Name, version and description of the configured classifier.
+
+    Raises:
+        RuntimeError: No classifier is configured (`CLASSIFIER_CONFIG` is unset).
+        TypeError: `CLASSIFIER_CONFIG` configures a model that is not a classifier.
+    """
+    return _classifier().info
+
+
+@functools.cache
+def _classifier() -> ClassifierBase:
+    """Build the classifier from `settings.CLASSIFIER_CONFIG` on first use, then reuse it.
+
+    The model is cached per process for now; a later change replaces this with a session object
+    that can load and reload models on request.
+    """
+    if settings.CLASSIFIER_CONFIG is None:
+        raise RuntimeError(
+            "no classifier configured: set the CLASSIFIER_CONFIG environment variable to a model config file"
+        )
+    model = load_model(settings.CLASSIFIER_CONFIG)
+    if not isinstance(model, ClassifierBase):
+        raise TypeError(f"CLASSIFIER_CONFIG must configure a classifier, got {type(model).__name__}")
+    return model

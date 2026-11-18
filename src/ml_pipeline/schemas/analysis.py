@@ -1,10 +1,24 @@
 """Schemas for ML pipeline requests and responses."""
 
-from pydantic import BaseModel, ConfigDict, Field
+from pathlib import Path
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class AnalyzeRequest(BaseModel):
     image_paths: list[str] = Field(min_length=1)
+
+    @field_validator("image_paths")
+    @classmethod
+    def _paths_must_be_absolute(cls, image_paths: list[str]) -> list[str]:
+        """Reject relative paths (the service has no base directory to resolve them against) and
+        paths with NUL bytes (no file system accepts them; opening one raises ValueError)."""
+        relative = [path for path in image_paths if not Path(path).is_absolute()]
+        if relative:
+            raise ValueError(f"image paths must be absolute, got {relative}")
+        if any("\x00" in path for path in image_paths):
+            raise ValueError("image paths must not contain NUL bytes")
+        return image_paths
 
 
 class ModelInfo(BaseModel):
@@ -52,10 +66,14 @@ class Detection(BaseModel):
 
 
 class ImageResult(BaseModel):
+    """Analysis result of one requested image."""
+
     image_path: str
     detection_model: ModelInfo
     classification_model: ModelInfo
     detections: list[Detection]
+    # set (with empty detections) when the image could not be loaded
+    error: str | None = None
 
 
 class AnalyzeResponse(BaseModel):
