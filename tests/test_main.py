@@ -4,7 +4,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ml_pipeline.main import app
-from tests.service_support import ANIMAL_BOX, CLASSIFIER_INFO, DETECTOR_INFO, HUMAN_BOX, RED_TAXON, write_two_colour_image
+from tests.service_support import (
+    ANIMAL_BOX,
+    CLASSIFIER_INFO,
+    DETECTOR_INFO,
+    HUMAN_BOX,
+    RED_TAXON,
+    write_two_colour_image,
+)
 
 
 @pytest.fixture

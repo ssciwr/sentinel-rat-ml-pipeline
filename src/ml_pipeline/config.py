@@ -12,8 +12,6 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="", env_ignore_empty=True)
 
     ML_PIPELINE_PORT: int = 8000
-    # Model config files (see README); unset means the service has no model of that kind and
-    # fails on first use with an error naming the variable.
     DETECTOR_CONFIG: Path | None = None
     CLASSIFIER_CONFIG: Path | None = None
 

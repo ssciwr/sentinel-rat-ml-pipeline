@@ -52,19 +52,7 @@ def write_service_configs(directory: Path) -> tuple[Path, Path]:
     torch.save(tiny_models.FixedRowsDetector(DETECTOR_ROWS), detector_pt)
     torch.save(tiny_models.ColourClassifier(), classifier_pt)
 
-    detector_config = directory / "detector.yaml"
-    detector_config.write_text(
-        yaml.safe_dump(
-            {
-                "type": "TorchDetector",
-                "info": DETECTOR_INFO,
-                "model_path": str(detector_pt),
-                "conf_limit": 0.5,
-                "preprocessing": {},
-                "labels": DETECTOR_LABELS,
-            }
-        )
-    )
+    detector_config = _write_detector_config(directory / "detector.yaml", detector_pt)
     classifier_config = directory / "classifier.yaml"
     classifier_config.write_text(
         yaml.safe_dump(
@@ -93,8 +81,12 @@ def write_broken_detector_config(directory: Path) -> Path:
     """
     model_pt = directory / "broken_detector.pt"
     torch.save(tiny_models.ContractBreaker("det_score_range"), model_pt)
-    config = directory / "broken_detector.yaml"
-    config.write_text(
+    return _write_detector_config(directory / "broken_detector.yaml", model_pt)
+
+
+def _write_detector_config(path: Path, model_pt: Path) -> Path:
+    """Write the service's TorchDetector config for the pickled module `model_pt`."""
+    path.write_text(
         yaml.safe_dump(
             {
                 "type": "TorchDetector",
@@ -106,7 +98,7 @@ def write_broken_detector_config(directory: Path) -> Path:
             }
         )
     )
-    return config
+    return path
 
 
 def write_truncated_jpeg(path: Path) -> Path:

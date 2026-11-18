@@ -45,7 +45,9 @@ def _detector() -> DetectorBase:
     that can load and reload models on request.
     """
     if settings.DETECTOR_CONFIG is None:
-        raise RuntimeError("no detector configured: set the DETECTOR_CONFIG environment variable to a model config file")
+        raise RuntimeError(
+            "no detector configured: set the DETECTOR_CONFIG environment variable to a model config file"
+        )
     model = load_model(settings.DETECTOR_CONFIG)
     if not isinstance(model, DetectorBase):
         raise TypeError(f"DETECTOR_CONFIG must configure a detector, got {type(model).__name__}")

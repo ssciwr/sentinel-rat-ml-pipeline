@@ -8,6 +8,7 @@ configs of tests/service_support.py: a detector with a fixed `animal` box (left 
 import pytest
 from PIL import Image
 
+from ml_pipeline.config import settings
 from ml_pipeline.schemas.analysis import AnalyzeResponse, Classification, Detection, ModelInfo
 from ml_pipeline.services.analysis import analyze_images
 from ml_pipeline.services.classification import classification_model, classify_species
@@ -71,8 +72,6 @@ def test_model_info_comes_from_the_configs(configured_services):
 )
 def test_unset_model_config_raises_naming_the_setting(configured_services, monkeypatch, setting, call):
     """Without a configured model the service fails with an error naming the env var."""
-    from ml_pipeline.config import settings
-
     monkeypatch.setattr(settings, setting, None)
     with pytest.raises(RuntimeError, match=setting):
         call()
@@ -80,8 +79,6 @@ def test_unset_model_config_raises_naming_the_setting(configured_services, monke
 
 def test_swapped_model_configs_raise(configured_services, monkeypatch):
     """A classifier config as DETECTOR_CONFIG (or vice versa) is a TypeError, not a silent mix-up."""
-    from ml_pipeline.config import settings
-
     detector_config, classifier_config = configured_services
     monkeypatch.setattr(settings, "DETECTOR_CONFIG", classifier_config)
     monkeypatch.setattr(settings, "CLASSIFIER_CONFIG", detector_config)
@@ -93,8 +90,6 @@ def test_swapped_model_configs_raise(configured_services, monkeypatch):
 
 def test_models_are_built_once(configured_services, monkeypatch, tmp_path):
     """Once built, a model is reused: later calls work even if its config is gone."""
-    from ml_pipeline.config import settings
-
     image = Image.new("RGB", (4, 4))
     detect_animals(image)
     classify_species(image)
@@ -205,8 +200,6 @@ def test_truncated_image_is_analysed(configured_services, tmp_path):
 def test_model_errors_are_not_turned_into_image_errors(configured_services, monkeypatch, two_colour_image, tmp_path):
     """Only loading errors are per-image results; a model that breaks its contract is a
     server fault and propagates (the API answers 500)."""
-    from ml_pipeline.config import settings
-
     monkeypatch.setattr(settings, "DETECTOR_CONFIG", write_broken_detector_config(tmp_path))
     with pytest.raises(ValueError):
         analyze_images([str(two_colour_image)])

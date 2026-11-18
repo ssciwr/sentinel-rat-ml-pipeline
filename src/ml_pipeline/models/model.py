@@ -131,26 +131,6 @@ def resolve_weights(
         return Path(hf_hub_download(repo_id=hf_repo, filename=hf_filename, revision=hf_revision))
 
 
-def ensure_pil(image: Any) -> Image.Image:
-    """Check that preprocessing kept a PIL image, for backends that preprocess PIL images themselves.
-
-    Args:
-        image: One preprocessed image.
-
-    Returns:
-        `image`, unchanged.
-
-    Raises:
-        TypeError: The configured preprocessing turned the image into something else.
-    """
-    if not isinstance(image, Image.Image):
-        raise TypeError(
-            f"this model needs PIL images; preprocessing produced {type(image).__name__} "
-            "(remove tensor-producing transforms such as pil_to_tensor)"
-        )
-    return image
-
-
 def _validate_conf_limit(conf_limit: Any) -> None:
     """Reject non-numeric confidence limits and values outside [0, 1] (including NaN)."""
     if isinstance(conf_limit, bool) or not isinstance(conf_limit, (int, float)):
@@ -337,8 +317,8 @@ class DetectorBase(ModelBase[Detection]):
             )
             for index, (x_min, y_min, x_max, y_max) in zip(kept.tolist(), xyxy[kept].tolist())
         ]
-        # clone: callers get an ordinary tensor even if the backend computed in inference mode
-        return scores[kept].clone(), detections
+        # indexing copies, so callers get an ordinary tensor even if the backend computed in inference mode
+        return scores[kept], detections
 
     def _output_label(self, label: str) -> str:
         """Apply `label_map` to one model label."""
@@ -391,9 +371,9 @@ class _UltralyticsMixin:
     def _load_model(self, weights: str | Path) -> YOLO:
         """Load a YOLO model; known asset names (e.g. `yolo26n.pt`) are downloaded by ultralytics.
 
-        A missing path whose basename *is* an asset name (e.g. a mistyped
-        `models/custom/yolo26n.pt`) downloads the stock pretrained weights to that path:
-        that is ultralytics' own behaviour.
+        If the file does not exist and its basename is an asset name, ultralytics downloads the
+        pretrained weights to that path, so a mistyped `models/custom/yolo26n.pt` gets the stock
+        weights: that is ultralytics' own behaviour.
 
         Raises:
             FileNotFoundError: The path does not exist and is no ultralytics asset name.
@@ -411,9 +391,17 @@ class _UltralyticsMixin:
         return model
 
     def _run_yolo(self, preprocessed: Any, **predict_kwargs) -> Any:
-        """Run ultralytics on one PIL image (it letterboxes and normalises itself); return its result."""
-        image = ensure_pil(preprocessed)
-        return self.model.predict(source=image, device=self.DEVICE, verbose=False, **predict_kwargs)[0]
+        """Run ultralytics on one PIL image (it letterboxes and normalises itself); return its result.
+
+        Raises:
+            TypeError: The configured preprocessing did not keep a PIL image.
+        """
+        if not isinstance(preprocessed, Image.Image):
+            raise TypeError(
+                f"YOLO models need PIL images; preprocessing produced {type(preprocessed).__name__} "
+                "(remove tensor-producing transforms such as pil_to_tensor)"
+            )
+        return self.model.predict(source=preprocessed, device=self.DEVICE, verbose=False, **predict_kwargs)[0]
 
 
 class YoloDetector(_UltralyticsMixin, DetectorBase):
@@ -421,8 +409,7 @@ class YoloDetector(_UltralyticsMixin, DetectorBase):
 
     Boxes are relative to the preprocessed image, so they match the original image only if
     preprocessing does not crop, pad or flip. `model_path` may be an ultralytics asset name such
-    as `yolo26n.pt`: if the file does not exist, ultralytics downloads the pretrained weights to
-    that path. A mistyped path ending in an asset name therefore downloads the stock weights. Ultralytics keeps at most 300 boxes
+    as `yolo26n.pt` (see `_UltralyticsMixin._load_model`). Ultralytics keeps at most 300 boxes
     per image (`max_det` default) and drops boxes whose score equals `conf_limit` exactly (it
     filters with `>`). See `DetectorBase` / `ModelBase` for the arguments.
     """
@@ -444,9 +431,8 @@ class YoloDetector(_UltralyticsMixin, DetectorBase):
 class YoloClassifier(_UltralyticsMixin, ClassifierBase):
     """Ultralytics YOLO classifier.
 
-    `model_path` may be an ultralytics asset name such as `yolo26n-cls.pt`, which ultralytics
-    downloads if the file does not exist (also for a mistyped path ending in such a name).
-    See `ClassifierBase` / `ModelBase` for the arguments.
+    `model_path` may be an ultralytics asset name such as `yolo26n-cls.pt` (see
+    `_UltralyticsMixin._load_model`). See `ClassifierBase` / `ModelBase` for the arguments.
 
     Raises:
         ValueError: The number of `classes` differs from the model's number of classes.
@@ -567,7 +553,8 @@ class TorchClassifier(_TorchModelMixin, ClassifierBase):
             probabilities = torch.softmax(output.float(), dim=1)
         else:
             probabilities = output.float()
-        # clone: the output was computed under inference mode; callers get an ordinary tensor
+        # clone: the output was computed under inference mode, and without softmax `probabilities`
+        # is still that inference tensor; callers get an ordinary tensor
         row = probabilities[0].cpu().clone()
         return row, self._make_classifications(row)
 
@@ -619,7 +606,7 @@ class TorchDetector(_TorchModelMixin, DetectorBase):
         """Detect and label boxes in one preprocessed tensor."""
         output = self._forward(preprocessed)
         self._check_output(output)
-        rows = output[0].float().cpu().clone()
+        rows = output[0].float().cpu()
         # Mask computed once: padding (score 0) and rows below conf_limit are dropped here, and
         # only kept rows must carry valid boxes and class indices.
         kept = rows[(rows[:, 4] > 0) & (rows[:, 4] >= self.conf_limit)]

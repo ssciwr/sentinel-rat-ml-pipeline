@@ -10,7 +10,7 @@ class AnalyzeRequest(BaseModel):
 
     @field_validator("image_paths")
     @classmethod
-    def _paths_must_be_absolute(cls, image_paths: list[str]) -> list[str]:
+    def _validate_paths(cls, image_paths: list[str]) -> list[str]:
         """Reject relative paths (the service has no base directory to resolve them against) and
         paths with NUL bytes (no file system accepts them; opening one raises ValueError)."""
         relative = [path for path in image_paths if not Path(path).is_absolute()]

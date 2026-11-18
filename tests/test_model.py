@@ -115,7 +115,11 @@ def _seeded(seed: int, build):
 
 
 def _open_rgb(path: Path) -> Image.Image:
-    """Open an image file as an EXIF-transposed RGB image (the service's job in production)."""
+    """Open an image file as an EXIF-transposed RGB image (the service's job in production).
+
+    Same steps as `ml_pipeline.services.images.load_image`, kept here on purpose so the model
+    tests do not depend on the service layer.
+    """
     with Image.open(path) as image:
         return ImageOps.exif_transpose(image).convert("RGB")
 
@@ -229,15 +233,21 @@ def _box_coords(detections: list[Detection]) -> list[float]:
 # ------------------------------------------------------------------- torch classifier
 
 
+def _raw_output(model_path: Path, image: Image.Image, *extra_transforms: v2.Transform) -> torch.Tensor:
+    """The eval-mode module's output row for one image, fed by hand (float [0, 1] tensor plus
+    `extra_transforms`): the reference the pipeline's predictions are compared with."""
+    raw = torch.load(model_path, weights_only=False).eval()
+    to_input = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32, scale=True), *extra_transforms])
+    with torch.inference_mode():
+        return raw(to_input(image).unsqueeze(0))[0]
+
+
 def test_torch_classifier_runs_in_eval_mode(logits_classifier_pt, colour_images):
     """Dropout is inactive: predictions equal the eval-mode module's softmax output."""
     model = make_torch_classifier(logits_classifier_pt)
-    raw = torch.load(logits_classifier_pt, weights_only=False).eval()
-    to_input = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32, scale=True)])
     for image in colour_images:
         probs, _ = model.predict(image)
-        with torch.inference_mode():
-            expected = torch.softmax(raw(to_input(image).unsqueeze(0)), dim=1)[0]
+        expected = torch.softmax(_raw_output(logits_classifier_pt, image), dim=0)
         assert torch.allclose(probs, expected, atol=1e-6)
 
 
@@ -255,13 +265,9 @@ def test_torch_classifier_payload_invariants(logits_classifier_pt, colour_images
 def test_torch_classifier_accepts_probabilities_without_softmax(probability_classifier_pt, colour_images):
     """With apply_softmax false the module's probabilities are used as they are."""
     model = make_torch_classifier(probability_classifier_pt, apply_softmax=False)
-    raw = torch.load(probability_classifier_pt, weights_only=False).eval()
-    to_input = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32, scale=True)])
     for image in colour_images:
         probs, _ = model.predict(image)
-        with torch.inference_mode():
-            expected = raw(to_input(image).unsqueeze(0))[0]
-        assert torch.allclose(probs, expected, atol=1e-6)
+        assert torch.allclose(probs, _raw_output(probability_classifier_pt, image), atol=1e-6)
 
 
 def test_torch_preprocessing_runs_after_tensor_conversion(probability_classifier_pt, colour_images):
@@ -271,12 +277,9 @@ def test_torch_preprocessing_runs_after_tensor_conversion(probability_classifier
     model = make_torch_classifier(
         probability_classifier_pt, apply_softmax=False, preprocessing={"normalize": normalise}
     )
-    raw = torch.load(probability_classifier_pt, weights_only=False).eval()
-    to_input = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32, scale=True), v2.Normalize(**normalise)])
     for image in colour_images:
         probs, _ = model.predict(image)
-        with torch.inference_mode():
-            expected = raw(to_input(image).unsqueeze(0))[0]
+        expected = _raw_output(probability_classifier_pt, image, v2.Normalize(**normalise))
         assert torch.allclose(probs, expected, atol=1e-6)
 
 
@@ -673,8 +676,13 @@ def test_non_list_classes_fail_before_download(hub_stub, classes):
     """classes must be a list of taxonomy entries (a single mapping or string is an error)."""
     with pytest.raises(TypeError):
         TorchClassifier(
-            info=INFO, hf_repo="org/repo", hf_filename="cls.pt", preprocessing={}, conf_limit=0.1,
-            classes=classes, apply_softmax=True,
+            info=INFO,
+            hf_repo="org/repo",
+            hf_filename="cls.pt",
+            preprocessing={},
+            conf_limit=0.1,
+            classes=classes,
+            apply_softmax=True,
         )
     assert hub_stub == []
 
@@ -991,7 +999,8 @@ def _direct_yolo_detections(weights: Path, image: Image.Image, conf: float) -> l
 
     model = YOLO(str(weights))
     result = model.predict(source=image, conf=conf, device="cpu", verbose=False)[0]
-    pairs = [(score, model.names[int(cls)]) for score, cls in zip(result.boxes.conf.tolist(), result.boxes.cls.tolist())]
+    boxes = result.boxes
+    pairs = [(score, model.names[int(cls)]) for score, cls in zip(boxes.conf.tolist(), boxes.cls.tolist())]
     return sorted(pairs, key=lambda pair: pair[0], reverse=True)
 
 
