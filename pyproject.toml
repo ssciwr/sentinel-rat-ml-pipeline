@@ -17,6 +17,12 @@ dependencies = [
     "uvicorn[standard]>=0.30.0",
     "pydantic>=2.7.0",
     "pydantic-settings>=2.3.0",
+    "torch>=2.15.0",
+    "torchvision>=0.29.2",
+    "ultralytics>=8.4.215",
+    "huggingface_hub>=1.0",
+    "pyyaml>=6.0",
+    "speciesnet>=5.0.6",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +30,7 @@ dev = [
     "pytest>=8.3.0",
     "pytest-cov>=5.0.0",
     "httpx2>=2.13.1",  # required by fastapi.testclient
+    "hypothesis>=6.100",
 ]
 
 [build-system]
@@ -36,3 +43,25 @@ packages = ["src/ml_pipeline"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "speciesnet_integration: opt-in test using real SpeciesNet inference and model weights (set RUN_SPECIESNET_INTEGRATION=1)",
+]
+
+# opencv-python (via ultralytics) and opencv-python-headless (via speciesnet -> yolov5 -> roboflow)
+# both install the same `cv2` package, so their versions must match. Headless 5.1.0.95 ships no
+# linux wheels; pinning it to 5.0.x matches opencv-python 5.0.x, as in smartrodent_experiments.
+# required-environments makes `uv lock` fail early if linux x86_64 (CI, server) loses wheels.
+[tool.uv]
+constraint-dependencies = ["opencv-python-headless>=5.0,<5.1"]
+required-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+# Inference runs on CPU only (no GPU on the server), so torch/torchvision come from the
+# CPU-only PyTorch index instead of PyPI, whose linux wheels pull in ~45 nvidia-* CUDA packages.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
