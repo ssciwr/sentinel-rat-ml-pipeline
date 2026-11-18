@@ -8,9 +8,12 @@ ENV PYTHONPATH=/app/src
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# --no-deps: requirements.txt is the complete, pinned export of uv.lock; letting pip resolve
+# dependencies itself would bring back opencv-python, which uv.lock deliberately overrides
+RUN pip install --no-cache-dir --no-deps -r requirements.txt
 
 COPY src/ ./src/
+COPY configs/ ./configs/
 
 EXPOSE 8000
 

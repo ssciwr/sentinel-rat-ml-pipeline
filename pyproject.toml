@@ -48,11 +48,13 @@ markers = [
     "speciesnet_integration: opt-in test using real SpeciesNet inference and model weights (set RUN_SPECIESNET_INTEGRATION=1)",
 ]
 
-# opencv-python (via ultralytics) and opencv-python-headless (via speciesnet -> yolov5 -> roboflow)
-# both install the same `cv2` package, so their versions must match. Headless 5.1.0.95 ships no
-# linux wheels; pinning it to 5.0.x matches opencv-python 5.0.x, as in smartrodent_experiments.
+# opencv: ultralytics requires the GUI build `opencv-python`, speciesnet (-> yolov5 -> roboflow) the
+# `opencv-python-headless` build; both install the same `cv2` module. The override drops the GUI
+# build (it needs X11/GL system libraries and is never used: no windows on a server), so `cv2` is
+# always the headless build. Headless 5.1.0.95 ships no linux wheels, hence the 5.0.x constraint.
 # required-environments makes `uv lock` fail early if linux x86_64 (CI, server) loses wheels.
 [tool.uv]
+override-dependencies = ["opencv-python; sys_platform == 'never'"]
 constraint-dependencies = ["opencv-python-headless>=5.0,<5.1"]
 required-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
 
