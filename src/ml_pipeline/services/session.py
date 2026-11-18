@@ -65,6 +65,13 @@ class Session:
     """The running detector and classifier, the configs they were built from, and when.
 
     Built with `build`; a new session replaces the old one as a whole.
+
+    Attributes:
+        detector: The running detector.
+        classifier: The running classifier.
+        detector_config: The config the detector was built from.
+        classifier_config: The config the classifier was built from.
+        created_at: When the session was built (UTC).
     """
 
     detector: DetectorBase
@@ -104,7 +111,11 @@ class Session:
         )
 
     def info(self) -> SessionInfo:
-        """The session's creation time and the model cards of its detector and classifier."""
+        """Describe the session for the API.
+
+        Returns:
+            The session's creation time and the model cards of its detector and classifier.
+        """
         detector_card = DetectorCard(
             role="detector",
             type=type(self.detector).__name__,
@@ -155,9 +166,10 @@ def build_session(
     try:
         return Session.build(detector_config, classifier_config)
     except (OSError, ValueError, TypeError, ImportError, RuntimeError) as error:
-        # anticipated: every way a config can be invalid or point at unusable weights (including
-        # download failures inside the SpeciesNet SDK, which are OSErrors); WeightsDownloadError
-        # is none of these and passes through for its own handling
+        # anticipated: every way a config can be invalid or point at unusable weights, including
+        # download failures inside the SpeciesNet SDK (OSErrors), hf_repo for SpeciesNet
+        # (NotImplementedError, a RuntimeError) and a pickled module whose package is missing
+        # (ImportError); WeightsDownloadError is none of these and passes through for its own handling
         raise SessionConfigError(f"{type(error).__name__}: {error}") from error
 
 

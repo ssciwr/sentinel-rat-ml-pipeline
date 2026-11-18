@@ -38,6 +38,11 @@ RED_TAXON = COLOUR_TAXA[0]
 IMAGE_SIZE = (16, 8)
 
 
+def config_values(path: Path) -> dict:
+    """The mapping of a YAML config file, e.g. to upload it or to change a copy of it."""
+    return yaml.safe_load(path.read_text())
+
+
 def write_service_configs(directory: Path) -> tuple[Path, Path]:
     """Pickle the tiny detector and classifier and write their YAML configs.
 

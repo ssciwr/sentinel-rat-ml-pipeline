@@ -3,32 +3,26 @@
 from datetime import UTC, datetime
 
 import pytest
-import yaml
 
 from ml_pipeline.models.model import TorchClassifier, TorchDetector
 from ml_pipeline.schemas.analysis import ModelInfo
 from ml_pipeline.schemas.session import ClassifierCard, DetectorCard, SessionInfo
 from ml_pipeline.services.session import ModelConfig, Session
-from tests.service_support import CLASSIFIER_INFO, COLOUR_TAXA, DETECTOR_INFO, DETECTOR_LABELS
-
-
-def _config_values(path) -> dict:
-    """The mapping of a YAML config file."""
-    return yaml.safe_load(path.read_text())
+from tests.service_support import CLASSIFIER_INFO, COLOUR_TAXA, DETECTOR_INFO, DETECTOR_LABELS, config_values
 
 
 def test_model_config_from_file_keeps_values_and_path(service_configs):
     """A config read from a file keeps its parsed mapping and names the file as its source."""
     detector_config, _ = service_configs
     config = ModelConfig.from_file(detector_config)
-    assert config.values == _config_values(detector_config)
+    assert config.values == config_values(detector_config)
     assert config.source == str(detector_config)
 
 
 def test_model_config_from_request_keeps_values(service_configs):
     """An uploaded config keeps its mapping; its source is the request."""
     detector_config, _ = service_configs
-    values = _config_values(detector_config)
+    values = config_values(detector_config)
     config = ModelConfig.from_request(values)
     assert config.values == values
     assert config.source == "request"
@@ -69,7 +63,7 @@ def test_wrong_kind_is_rejected_before_any_model_is_loaded(service_configs, tmp_
     """A config of the wrong kind fails on its `type`, before the other config's (here missing)
     weights would be loaded."""
     detector_config, _ = service_configs
-    classifier_values = _config_values(detector_config) | {"model_path": str(tmp_path / "missing.pt")}
+    classifier_values = config_values(detector_config) | {"model_path": str(tmp_path / "missing.pt")}
     with pytest.raises(TypeError):
         Session.build(ModelConfig.from_file(detector_config), ModelConfig.from_request(classifier_values))
 
@@ -89,7 +83,7 @@ def test_session_info_has_one_card_per_model(service_session, service_configs):
         info=ModelInfo(**DETECTOR_INFO),
         source=str(detector_config),
         conf_limit=0.5,
-        weights=_config_values(detector_config)["model_path"],
+        weights=config_values(detector_config)["model_path"],
         labels=DETECTOR_LABELS,
     )
     assert classifier_card == ClassifierCard(
@@ -98,7 +92,7 @@ def test_session_info_has_one_card_per_model(service_session, service_configs):
         info=ModelInfo(**CLASSIFIER_INFO),
         source=str(classifier_config),
         conf_limit=0.05,
-        weights=_config_values(classifier_config)["model_path"],
+        weights=config_values(classifier_config)["model_path"],
         num_classes=len(COLOUR_TAXA),
     )
 
@@ -106,7 +100,7 @@ def test_session_info_has_one_card_per_model(service_session, service_configs):
 def test_detector_card_shows_labels_after_label_map(service_configs):
     """The card lists the labels the detector returns, i.e. with label_map applied."""
     detector_config, classifier_config = service_configs
-    values = _config_values(detector_config) | {"label_map": {"human": "person"}}
+    values = config_values(detector_config) | {"label_map": {"human": "person"}}
 
     session = Session.build(ModelConfig.from_request(values), ModelConfig.from_file(classifier_config))
 
@@ -118,7 +112,7 @@ def test_detector_card_shows_labels_after_label_map(service_configs):
 def test_detector_card_lists_merged_labels_once(service_configs):
     """If label_map merges labels, each returned label is listed once."""
     detector_config, classifier_config = service_configs
-    values = _config_values(detector_config) | {"label_map": {"human": "animal"}}
+    values = config_values(detector_config) | {"label_map": {"human": "animal"}}
 
     session = Session.build(ModelConfig.from_request(values), ModelConfig.from_file(classifier_config))
 

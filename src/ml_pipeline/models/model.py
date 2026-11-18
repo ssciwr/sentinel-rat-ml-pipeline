@@ -1,9 +1,10 @@
-"""Model handling: build detectors and classifiers from config files and run them on one image.
+"""Model handling: build detectors and classifiers from configs and run them on one image.
 
 Every model follows one contract:
 
-- it is built from keyword arguments or, equivalently, from a YAML config file with the same
-  keys plus a `type` key naming the model class (`load_model`);
+- it is built from keyword arguments or, equivalently, from a config mapping with the same keys
+  plus a `type` key naming the model class (`build_model`; `read_config` reads such a mapping
+  from a YAML file, `load_model` does both);
 - `info` (name, version, description) names the model in API responses;
 - weights come from exactly one source: a local `model_path`, or a Hugging Face Hub file
   (`hf_repo` + `hf_filename`, optional `hf_revision`);
@@ -715,6 +716,21 @@ class _SpeciesnetSdkMixin:
     # The SDK's predict only echoes its filepath into the result; models never see paths.
     SDK_FILEPATH_PLACEHOLDER = "<in-memory image>"
 
+    @staticmethod
+    def _construct_sdk(sdk_class: type, weights: str | Path, **kwargs) -> Any:
+        """Construct an SDK component for a model folder or id.
+
+        Callers pass the SDK class they look up at call time, so tests can replace it.
+
+        Raises:
+            ValueError: A local model folder's info.json lacks an entry.
+        """
+        try:
+            return sdk_class(str(weights), **kwargs)
+        except KeyError as error:
+            # anticipated: a local model folder whose info.json lacks an entry
+            raise ValueError(f"SpeciesNet model {weights}: info.json lacks {error}") from error
+
 
 class SpeciesnetDetector(_SpeciesnetSdkMixin, DetectorBase):
     """SpeciesNet's detector component (MegaDetector), returning all boxes with their SDK label.
@@ -783,11 +799,7 @@ class SpeciesnetDetector(_SpeciesnetSdkMixin, DetectorBase):
 
     def _load_model(self, weights: str | Path) -> SpeciesNetDetector:
         """Load the SDK detector and force it onto the CPU."""
-        try:
-            detector = SpeciesNetDetector(str(weights))
-        except KeyError as error:
-            # anticipated: a local model folder whose info.json lacks an entry
-            raise ValueError(f"SpeciesNet model {weights}: info.json lacks {error}") from error
+        detector = self._construct_sdk(SpeciesNetDetector, weights)
         # The SDK picks cuda/mps/cpu itself and has no device argument; `predict` reads these
         # instance attributes, so setting them is how inference is kept on the CPU. (On a GPU
         # host the checkpoint is briefly loaded onto the GPU before this move.)
@@ -817,6 +829,9 @@ class SpeciesnetClassifier(_SpeciesnetSdkMixin, ClassifierBase):
     `preprocessing` must be present but empty. The taxonomy of each class comes from the
     model's label file (`uuid;class;order;family;genus;species;common name`), so there is no
     `classes` argument; empty label fields become `None`. Inference runs on CPU.
+
+    Kaggle models are downloaded and cached by the SDK (`kagglehub`); as for the detector, the
+    SDK also fetches the MegaDetector weights listed in the model's `info.json` on first use.
 
     Args:
         info: See `ModelBase`.
@@ -859,6 +874,7 @@ class SpeciesnetClassifier(_SpeciesnetSdkMixin, ClassifierBase):
             hf_filename=hf_filename,
             hf_revision=hf_revision,
         )
+        # by index, not dict order: label line i belongs to model output i
         label_lines = [self.model.labels[index] for index in range(len(self.model.labels))]
         self._set_classes([_taxon_from_label(line) for line in label_lines])
         # The SDK reports classes by label line, sorted by score, so lines must be unique (each
@@ -873,11 +889,7 @@ class SpeciesnetClassifier(_SpeciesnetSdkMixin, ClassifierBase):
         Raises:
             ValueError: The model is not a crop classifier (e.g. the `full_image` v4.0.3b).
         """
-        try:
-            classifier = SpeciesNetClassifier(str(weights), device=self.DEVICE)
-        except KeyError as error:
-            # anticipated: a local model folder whose info.json lacks an entry
-            raise ValueError(f"SpeciesNet model {weights}: info.json lacks {error}") from error
+        classifier = self._construct_sdk(SpeciesNetClassifier, weights, device=self.DEVICE)
         model_type = classifier.model_info.type_
         if model_type != self.CROP_MODEL_TYPE:
             raise ValueError(
@@ -975,20 +987,7 @@ def model_class_of(config: Mapping[str, Any]) -> type[ModelBase]:
     """
     if not isinstance(config, Mapping):
         raise TypeError(f"a model config must be a mapping, got {type(config).__name__}")
-    return _model_class(config.get("type"))
-
-
-def load_model(path: str | Path) -> ModelBase:
-    """Build a model from a YAML config file (`build_model(read_config(path))`).
-
-    Raises:
-        See `read_config` and `build_model`.
-    """
-    return build_model(read_config(path))
-
-
-def _model_class(model_type: Any) -> type[ModelBase]:
-    """Map a config's `type` value to its model class."""
+    model_type = config.get("type")
     match model_type:
         case "YoloDetector":
             return YoloDetector
@@ -1007,3 +1006,12 @@ def _model_class(model_type: Any) -> type[ModelBase]:
                 "config key `type` must be one of YoloDetector, SpeciesnetDetector, TorchDetector, "
                 f"YoloClassifier, SpeciesnetClassifier, TorchClassifier; got {model_type!r}"
             )
+
+
+def load_model(path: str | Path) -> ModelBase:
+    """Build a model from a YAML config file (`build_model(read_config(path))`).
+
+    Raises:
+        See `read_config` and `build_model`.
+    """
+    return build_model(read_config(path))

@@ -1,7 +1,8 @@
 # Validation baseline, classification: SpeciesNet's v4.0.3a crop classifier (always_crop) on the
 # detector's crops. Raw classifier output: no geofencing and no taxonomic rollup, so results can
 # differ from SpeciesNet's full ensemble prediction. Taxonomy comes from the model's label file.
-# The SpeciesNet SDK downloads the model from Kaggle on first use.
+# The SpeciesNet SDK downloads the model from Kaggle (and the MegaDetector weights listed in its
+# info.json from GitHub) on first use.
 type: SpeciesnetClassifier
 info:
   name: speciesnet-classifier

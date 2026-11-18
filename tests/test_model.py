@@ -14,11 +14,11 @@ import socket
 import sys
 from pathlib import Path
 
+import httpx2
 import numpy as np
 import pytest
 import torch
 import yaml
-import httpx2
 from huggingface_hub.errors import LocalEntryNotFoundError, OfflineModeIsEnabled
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -89,6 +89,7 @@ DETECTOR_ROWS = [
 ]
 
 SPECIESNET_V403B = "kaggle:google/speciesnet/pyTorch/v4.0.3b/1"
+SPECIESNET_V403A = "kaggle:google/speciesnet/pyTorch/v4.0.3a/1"
 # smallest float32 >= 0.01 (SpeciesNet's score floor); 0.01 itself is not representable in float32
 SPECIESNET_FLOOR_F32 = float(np.nextafter(np.float32(0.01), np.float32(1.0)))
 
@@ -329,6 +330,24 @@ def test_torch_preprocessing_must_produce_tensors(logits_classifier_pt, colour_i
     model = make_torch_classifier(logits_classifier_pt, preprocessing={"to_pil_image": {}})
     with pytest.raises(TypeError):
         model.predict(colour_images[0])
+
+
+@pytest.mark.parametrize(
+    "content", [b"not a pickle at all", b"", b'{"weights": [1, 2, 3]}'], ids=["garbage", "empty", "json"]
+)
+def test_weights_that_are_no_torch_pickle_raise_value_error(tmp_path, content):
+    """A weights file that torch.load cannot unpickle (safetensors, JSON, a truncated download) is
+    an invalid config: ValueError naming the file."""
+    path = tmp_path / "weights.pt"
+    path.write_bytes(content)
+    with pytest.raises(ValueError, match="weights.pt"):
+        make_torch_classifier(path)
+
+
+def test_missing_local_weights_stay_a_file_not_found_error(tmp_path):
+    """A missing local weights file is a config error (FileNotFoundError), not a download error."""
+    with pytest.raises(FileNotFoundError):
+        make_torch_classifier(tmp_path / "missing.pt")
 
 
 # --------------------------------------------------------------------- torch detector
@@ -775,7 +794,7 @@ def test_non_bool_apply_softmax_raises(logits_classifier_pt, apply_softmax):
         make_torch_classifier(logits_classifier_pt, apply_softmax=apply_softmax)
 
 
-# ------------------------------------------------------------------------ load_model
+# ---------------------------------------------------------------------- config files
 
 
 def _write_config(path: Path, config) -> Path:
@@ -970,24 +989,6 @@ def test_failing_hub_download_raises_weights_download_error(monkeypatch, error):
         resolve_weights(None, "org/rodent-models", "cls.pt", None)
     assert excinfo.value.__cause__ is error
     assert not issubclass(WeightsDownloadError, OSError)
-
-
-@pytest.mark.parametrize(
-    "content", [b"not a pickle at all", b"", b'{"weights": [1, 2, 3]}'], ids=["garbage", "empty", "json"]
-)
-def test_weights_that_are_no_torch_pickle_raise_value_error(tmp_path, content):
-    """A weights file that torch.load cannot unpickle (safetensors, JSON, a truncated download) is
-    an invalid config: ValueError naming the file."""
-    path = tmp_path / "weights.pt"
-    path.write_bytes(content)
-    with pytest.raises(ValueError, match="weights.pt"):
-        make_torch_classifier(path)
-
-
-def test_missing_local_weights_stay_a_file_not_found_error(tmp_path):
-    """A missing local weights file is a config error (FileNotFoundError), not a download error."""
-    with pytest.raises(FileNotFoundError):
-        make_torch_classifier(tmp_path / "missing.pt")
 
 
 @pytest.mark.parametrize(
@@ -1484,8 +1485,6 @@ def test_speciesnet_weights_name_the_default_model(speciesnet_stub):
 
 
 # ------------------------------------------------------- SpeciesNet classifier (stub)
-
-SPECIESNET_V403A = "kaggle:google/speciesnet/pyTorch/v4.0.3a/1"
 
 # SDK label lines: uuid;class;order;family;genus;species;common name. As in the real label file,
 # two labels (u0, u3) differ only in their uuid, and one (u4) has no common name.

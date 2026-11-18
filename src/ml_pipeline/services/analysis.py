@@ -2,7 +2,7 @@
 
 from PIL import Image
 
-from ml_pipeline.schemas.analysis import AnalyzeResponse, ImageResult
+from ml_pipeline.schemas.analysis import AnalyzeResponse, Detection, ImageResult
 from ml_pipeline.services.classification import classify_species
 from ml_pipeline.services.detection import detect_animals
 from ml_pipeline.services.images import crop, load_image
@@ -36,21 +36,23 @@ def _analyze_image(image_path: str, session: Session) -> ImageResult:
         image = load_image(image_path)
     except (OSError, Image.DecompressionBombError) as error:
         # anticipated: the file is missing, unreadable, not an image or too large
-        return ImageResult(
-            image_path=image_path,
-            detection_model=session.detector.info,
-            classification_model=session.classifier.info,
-            detections=[],
-            error=f"{type(error).__name__}: {error}",
-        )
-
-    detections = detect_animals(session.detector, image)
-    for detection in detections:
-        if detection.detected_class == CLASSIFIED_CLASS:
-            detection.classifications = classify_species(session.classifier, crop(image, detection.bbox))
+        detections, error_message = [], f"{type(error).__name__}: {error}"
+    else:
+        # outside the try: model errors are not this image's loading error
+        detections, error_message = _detect_and_classify(image, session), None
     return ImageResult(
         image_path=image_path,
         detection_model=session.detector.info,
         classification_model=session.classifier.info,
         detections=detections,
+        error=error_message,
     )
+
+
+def _detect_and_classify(image: Image.Image, session: Session) -> list[Detection]:
+    """Detect objects in a loaded image and classify the crop of each animal detection."""
+    detections = detect_animals(session.detector, image)
+    for detection in detections:
+        if detection.detected_class == CLASSIFIED_CLASS:
+            detection.classifications = classify_species(session.classifier, crop(image, detection.bbox))
+    return detections

@@ -4,10 +4,10 @@ import os
 import shutil
 from pathlib import Path
 
+import httpx2
 import pytest
 import yaml
 from fastapi.testclient import TestClient
-import httpx2
 from huggingface_hub.errors import LocalEntryNotFoundError
 
 from ml_pipeline.config import settings
@@ -18,6 +18,7 @@ from tests.service_support import (
     DETECTOR_INFO,
     HUMAN_BOX,
     RED_TAXON,
+    config_values,
     write_two_colour_image,
 )
 
@@ -36,11 +37,6 @@ def _fresh_client(monkeypatch, detector_config: Path | None, classifier_config: 
 def client(monkeypatch, service_configs) -> TestClient:
     """A test client of the app without a session, whose env settings name the tiny-model configs."""
     return _fresh_client(monkeypatch, *service_configs)
-
-
-def _config_values(path: Path) -> dict:
-    """The mapping of a YAML config file, as a client would upload it."""
-    return yaml.safe_load(path.read_text())
 
 
 def test_health_endpoint(client) -> None:
@@ -131,7 +127,7 @@ def test_analyze_uses_the_current_session(client, service_configs, tmp_path) -> 
     renamed `animal` boxes are no longer classified."""
     detector_config, _ = service_configs
     image = str(write_two_colour_image(tmp_path / "image.png"))
-    uploaded = _config_values(detector_config) | {"label_map": {"animal": "critter"}}
+    uploaded = config_values(detector_config) | {"label_map": {"animal": "critter"}}
 
     assert client.post("/api/v1/session", json={"detector": uploaded}).status_code == 200
     (result,) = client.post("/api/v1/analyze", json={"image_paths": [image]}).json()["results"]
@@ -182,7 +178,7 @@ def editable_configs(client, monkeypatch, service_configs, tmp_path) -> tuple[Pa
 
 def _rename_model(config: Path, name: str) -> None:
     """Change the `info.name` of a config file."""
-    values = _config_values(config)
+    values = config_values(config)
     values["info"]["name"] = name
     config.write_text(yaml.safe_dump(values))
 
@@ -210,7 +206,7 @@ def test_post_session_with_uploaded_config_switches_that_model(client, service_c
     _, env_classifier_config = editable_configs
     client.get("/api/v1/session")
     _rename_model(env_classifier_config, "edited-classifier")
-    uploaded = _config_values(detector_config) | {
+    uploaded = config_values(detector_config) | {
         "info": {"name": "relabelled-detector", "version": "2"},
         "label_map": {"human": "person"},
     }
@@ -233,19 +229,26 @@ def test_post_session_with_both_configs_needs_no_env(monkeypatch, service_config
 
     response = client.post(
         "/api/v1/session",
-        json={"detector": _config_values(detector_config), "classifier": _config_values(classifier_config)},
+        json={"detector": config_values(detector_config), "classifier": config_values(classifier_config)},
     )
 
     assert response.status_code == 200
     assert [card["source"] for card in response.json()["models"]] == ["request", "request"]
 
 
+def _hub_classifier_values(classifier_config: Path, **hub_args) -> tuple[dict, str]:
+    """The classifier config with HF Hub weights (`hub_args`) instead of its local model_path,
+    and that local path (what a stubbed hf_hub_download returns)."""
+    values = config_values(classifier_config)
+    local_weights = values.pop("model_path")
+    return values | {"hf_repo": "org/rodent-models", "hf_filename": "cls.pt"} | hub_args, local_weights
+
+
 def test_post_session_with_hub_config_downloads_the_weights(client, service_configs, monkeypatch) -> None:
     """An uploaded config with HF Hub arguments loads its weights through hf_hub_download, and
     the card names the Hub file."""
     _, classifier_config = service_configs
-    values = _config_values(classifier_config)
-    local_weights = values.pop("model_path")
+    uploaded, local_weights = _hub_classifier_values(classifier_config, hf_revision="v1")
     calls = []
 
     def fake_hf_hub_download(repo_id, filename, revision=None, **kwargs):
@@ -253,7 +256,6 @@ def test_post_session_with_hub_config_downloads_the_weights(client, service_conf
         return local_weights
 
     monkeypatch.setattr("ml_pipeline.models.model.hf_hub_download", fake_hf_hub_download)
-    uploaded = values | {"hf_repo": "org/rodent-models", "hf_filename": "cls.pt", "hf_revision": "v1"}
 
     response = client.post("/api/v1/session", json={"classifier": uploaded})
 
@@ -279,6 +281,17 @@ def _without(values: dict, key: str) -> dict:
         ("detector", lambda det, cls: det | {"model_path": "/nonexistent/detector.pt"}),
         ("detector", lambda det, cls: cls),
         ("classifier", lambda det, cls: det),
+        (
+            "detector",
+            lambda det, cls: {
+                "type": "SpeciesnetDetector",
+                "info": det["info"],
+                "preprocessing": {},
+                "conf_limit": 0.1,
+                "hf_repo": "org/speciesnet",
+                "hf_filename": "model.pt",
+            },
+        ),
     ],
     ids=[
         "unknown_type",
@@ -288,6 +301,7 @@ def _without(values: dict, key: str) -> dict:
         "missing_weights",
         "classifier_as_detector",
         "detector_as_classifier",
+        "speciesnet_from_hf_repo",
     ],
 )
 def test_post_session_with_invalid_config_is_rejected_and_keeps_the_old_session(
@@ -295,7 +309,7 @@ def test_post_session_with_invalid_config_is_rejected_and_keeps_the_old_session(
 ) -> None:
     """An invalid uploaded config gives 422 with a message; the running session stays."""
     old = client.get("/api/v1/session").json()
-    uploaded = make_config(*(_config_values(path) for path in service_configs))
+    uploaded = make_config(*(config_values(path) for path in service_configs))
 
     response = client.post("/api/v1/session", json={role: uploaded})
 
@@ -309,7 +323,7 @@ def test_post_session_with_unknown_role_is_rejected(client, service_configs) -> 
     detector_config, _ = service_configs
     old = client.get("/api/v1/session").json()
 
-    response = client.post("/api/v1/session", json={"detectr": _config_values(detector_config)})
+    response = client.post("/api/v1/session", json={"detectr": config_values(detector_config)})
 
     assert response.status_code == 422
     assert client.get("/api/v1/session").json() == old
@@ -321,7 +335,7 @@ def test_post_session_with_unset_env_for_an_omitted_role_is_rejected(client, ser
     old = client.get("/api/v1/session").json()
     monkeypatch.setattr(settings, "CLASSIFIER_CONFIG", None)
 
-    response = client.post("/api/v1/session", json={"detector": _config_values(detector_config)})
+    response = client.post("/api/v1/session", json={"detector": config_values(detector_config)})
 
     assert response.status_code == 422
     assert "CLASSIFIER_CONFIG" in response.json()["detail"]
@@ -342,10 +356,7 @@ def test_post_session_with_failing_hub_download_is_rejected(client, service_conf
         raise error
 
     monkeypatch.setattr("ml_pipeline.models.model.hf_hub_download", offline_hf_hub_download)
-    uploaded = _without(_config_values(classifier_config), "model_path") | {
-        "hf_repo": "org/rodent-models",
-        "hf_filename": "cls.pt",
-    }
+    uploaded, _ = _hub_classifier_values(classifier_config)
 
     response = client.post("/api/v1/session", json={"classifier": uploaded})
 
@@ -386,10 +397,9 @@ def test_lazy_session_with_failing_hub_download_is_unavailable_until_it_works(
     """An env config whose Hub download fails makes the lazy build answer 503; once the
     download works, the next request builds the session."""
     _, classifier_config = service_configs
-    values = _config_values(classifier_config)
-    local_weights = values.pop("model_path")
+    values, local_weights = _hub_classifier_values(classifier_config)
     hub_config = tmp_path / "hub_classifier.yaml"
-    hub_config.write_text(yaml.safe_dump(values | {"hf_repo": "org/rodent-models", "hf_filename": "cls.pt"}))
+    hub_config.write_text(yaml.safe_dump(values))
     monkeypatch.setattr(settings, "CLASSIFIER_CONFIG", hub_config)
     hub_reachable = False
 
