@@ -6,6 +6,8 @@ from ml_pipeline.api.routes import router as api_router
 
 app = FastAPI(title="ML Pipeline", version="0.1.0")
 app.include_router(api_router, prefix="/api/v1")
+# the running models; built on the first request that needs them (see api.routes.get_session)
+app.state.session = None
 
 
 @app.get("/health")

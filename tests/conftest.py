@@ -1,12 +1,10 @@
-"""Fixtures shared by the service and API tests."""
+"""Fixtures shared by the service, session and API tests."""
 
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from ml_pipeline.config import settings
-from ml_pipeline.services import classification, detection
+from ml_pipeline.services.session import ModelConfig, Session
 from tests.service_support import write_service_configs
 
 
@@ -16,18 +14,8 @@ def service_configs(tmp_path_factory) -> tuple[Path, Path]:
     return write_service_configs(tmp_path_factory.mktemp("service_models"))
 
 
-def _clear_model_caches() -> None:
-    """Forget the models the services built, so the next call reads the current settings."""
-    detection._detector.cache_clear()
-    classification._classifier.cache_clear()
-
-
 @pytest.fixture
-def configured_services(monkeypatch, service_configs) -> Iterator[tuple[Path, Path]]:
-    """Point the service settings at the tiny-model configs, with freshly built models."""
+def service_session(service_configs) -> Session:
+    """A session running the tiny service models, built from their config files."""
     detector_config, classifier_config = service_configs
-    monkeypatch.setattr(settings, "DETECTOR_CONFIG", detector_config)
-    monkeypatch.setattr(settings, "CLASSIFIER_CONFIG", classifier_config)
-    _clear_model_caches()
-    yield service_configs
-    _clear_model_caches()
+    return Session.build(ModelConfig.from_file(detector_config), ModelConfig.from_file(classifier_config))

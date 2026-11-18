@@ -47,7 +47,7 @@ class Taxon(BaseModel):
     class_name: str | None = None
     order: str | None = None
     family: str | None = None
-    genus: str
+    genus: str | None = None  # None for family/order-level classes and labels without taxonomy
     species: str | None = None
     common_name: str | None = None
 

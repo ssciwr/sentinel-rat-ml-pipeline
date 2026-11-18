@@ -15,16 +15,21 @@ Every model follows one contract:
 There is no batching: every call processes one image. All inference runs on CPU.
 """
 
+import pickle
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+# httpx2 is huggingface_hub's HTTP client (a dependency of it); its network errors are no OSErrors
+import httpx2
 import torch
 import yaml
 from huggingface_hub import hf_hub_download
 from PIL import Image
+from speciesnet.classifier import SpeciesNetClassifier
 from speciesnet.detector import SpeciesNetDetector
+from speciesnet.utils import BBox
 from torchvision.transforms import v2
 from torchvision.transforms.v2 import functional as tv_functional
 from ultralytics import YOLO
@@ -93,6 +98,10 @@ def _normalise_name(name: str) -> str:
     return name.replace("_", "").lower()
 
 
+class WeightsDownloadError(Exception):
+    """Model weights could not be downloaded from the Hugging Face Hub (network, access, missing file)."""
+
+
 def resolve_weights(
     model_path: str | Path | None,
     hf_repo: str | None,
@@ -116,6 +125,7 @@ def resolve_weights(
 
     Raises:
         ValueError: Not exactly one weights source, or incomplete/stray Hub arguments.
+        WeightsDownloadError: The Hub file could not be downloaded.
     """
     if model_path is not None and hf_repo is not None:
         raise ValueError("give either model_path or hf_repo, not both")
@@ -128,7 +138,27 @@ def resolve_weights(
     else:
         if hf_filename is None:
             raise ValueError("hf_repo needs hf_filename: the file to download from the repository")
-        return Path(hf_hub_download(repo_id=hf_repo, filename=hf_filename, revision=hf_revision))
+        try:
+            return Path(hf_hub_download(repo_id=hf_repo, filename=hf_filename, revision=hf_revision))
+        except (OSError, httpx2.HTTPError) as error:
+            # huggingface_hub reports HTTP and cache failures as OSError subclasses (like a missing
+            # local file) and lets httpx2's network errors through; a separate type lets callers
+            # tell download failures from config errors
+            raise WeightsDownloadError(
+                f"cannot download {hf_filename!r} from HF Hub repo {hf_repo!r}: {error}"
+            ) from error
+
+
+def _describe_weights(
+    model_path: str | Path | None, hf_repo: str | None, hf_filename: str | None, hf_revision: str | None
+) -> str:
+    """Name where a model's weights come from: the `model_path` as given, or `hf:<repo>/<file>[@<revision>]`."""
+    if model_path is not None:
+        return str(model_path)
+    elif hf_revision is None:
+        return f"hf:{hf_repo}/{hf_filename}"
+    else:
+        return f"hf:{hf_repo}/{hf_filename}@{hf_revision}"
 
 
 def _validate_conf_limit(conf_limit: Any) -> None:
@@ -229,6 +259,7 @@ class ModelBase[T](ABC):
         # Build the transform before resolving weights: a config typo fails before a download.
         self.transform = build_transform(preprocessing)
         weights = resolve_weights(model_path, hf_repo, hf_filename, hf_revision)
+        self.weights = _describe_weights(model_path, hf_repo, hf_filename, hf_revision)
         self.model = self._load_model(weights)
 
     def predict(self, image: Image.Image) -> tuple[torch.Tensor, list[T]]:
@@ -293,6 +324,12 @@ class DetectorBase(ModelBase[Detection]):
     def labels(self) -> tuple[str, ...]:
         """The labels the loaded model can emit (before `label_map`)."""
 
+    @property
+    def output_labels(self) -> list[str]:
+        """The labels `predict` can return, i.e. `labels` with `label_map` applied."""
+        # dict.fromkeys drops duplicates (label_map may merge labels) and keeps the order
+        return list(dict.fromkeys(self._output_label(label) for label in self.labels))
+
     def _make_detections(
         self, xyxy: torch.Tensor, scores: torch.Tensor, labels: Sequence[str]
     ) -> tuple[torch.Tensor, list[Detection]]:
@@ -331,23 +368,26 @@ class DetectorBase(ModelBase[Detection]):
 class ClassifierBase(ModelBase[Classification]):
     """Classifiers: `predict` returns probability vectors and taxonomy-carrying classifications.
 
-    Args:
-        classes: One taxonomy mapping (fields of `Taxon`) per model output index, in order.
-        **kwargs: See `ModelBase`.
-
-    Raises:
-        TypeError: `classes` is not a list.
-        ValueError: `classes` is empty or a taxonomy entry is invalid (e.g. no genus).
+    `classes` holds one `Taxon` per model output index. Subclasses set it with `_set_classes`:
+    from their config before loading (YOLO, torch), or from the loaded model (SpeciesNet, whose
+    label file carries the taxonomy). See `ModelBase` for the arguments.
     """
 
-    def __init__(self, *, classes: Sequence[Mapping[str, Any]], **kwargs):
+    classes: list[Taxon]
+
+    def _set_classes(self, classes: Sequence[Mapping[str, Any] | Taxon]) -> None:
+        """Validate and store the taxonomy of each model output index.
+
+        Raises:
+            TypeError: `classes` is not a list.
+            ValueError: `classes` is empty or a taxonomy entry is invalid.
+        """
         if isinstance(classes, (str, Mapping)) or not isinstance(classes, Sequence):
             raise TypeError(f"classes must be a list of taxonomy entries, got {classes!r}")
         if len(classes) == 0:
             raise ValueError("classes must have one taxonomy entry per model output")
         self.classes = [Taxon.model_validate(entry) for entry in classes]
         self._taxon_fields = [taxon.model_dump() for taxon in self.classes]
-        super().__init__(**kwargs)
 
     def _make_classifications(self, probabilities: torch.Tensor) -> list[Classification]:
         """Turn one `[C]` probability vector into classifications >= conf_limit, descending."""
@@ -432,15 +472,22 @@ class YoloClassifier(_UltralyticsMixin, ClassifierBase):
     """Ultralytics YOLO classifier.
 
     `model_path` may be an ultralytics asset name such as `yolo26n-cls.pt` (see
-    `_UltralyticsMixin._load_model`). See `ClassifierBase` / `ModelBase` for the arguments.
+    `_UltralyticsMixin._load_model`).
+
+    Args:
+        classes: One taxonomy mapping (fields of `Taxon`) per model output index, in order.
+        **kwargs: See `ModelBase`.
 
     Raises:
-        ValueError: The number of `classes` differs from the model's number of classes.
+        TypeError: `classes` is not a list.
+        ValueError: `classes` is empty, has an invalid entry, or its length differs from the
+            model's number of classes.
     """
 
     task = "classify"
 
-    def __init__(self, **kwargs):
+    def __init__(self, *, classes: Sequence[Mapping[str, Any]], **kwargs):
+        self._set_classes(classes)
         super().__init__(**kwargs)
         if len(self.classes) != len(self.model.names):
             raise ValueError(f"{len(self.classes)} taxonomy entries for a model with {len(self.model.names)} classes")
@@ -477,6 +524,9 @@ class _TorchModelMixin:
         # weights_only=False is required for whole pickled modules (the torch default is True).
         try:
             module = torch.load(weights, map_location=self.DEVICE, weights_only=False)
+        except (pickle.UnpicklingError, EOFError) as error:
+            # anticipated: not a torch.save pickle (e.g. safetensors, JSON, a truncated download)
+            raise ValueError(f"{weights} is not a whole module saved with torch.save ({error})") from error
         except (ModuleNotFoundError, AttributeError) as error:
             # pickle stores the module class by import path; anticipated when its package is missing
             raise ImportError(
@@ -533,16 +583,19 @@ class TorchClassifier(_TorchModelMixin, ClassifierBase):
     Args:
         apply_softmax: True if the module returns logits, False if it returns probabilities
             (values in [0, 1] summing to 1).
-        **kwargs: See `ClassifierBase` / `ModelBase`.
+        classes: One taxonomy mapping (fields of `Taxon`) per model output index, in order.
+        **kwargs: See `ModelBase`.
 
     Raises:
-        TypeError: `apply_softmax` is not a bool.
+        TypeError: `apply_softmax` is not a bool, or `classes` is not a list.
+        ValueError: `classes` is empty or has an invalid entry.
     """
 
-    def __init__(self, *, apply_softmax: bool, **kwargs):
+    def __init__(self, *, apply_softmax: bool, classes: Sequence[Mapping[str, Any]], **kwargs):
         if not isinstance(apply_softmax, bool):
             raise TypeError(f"apply_softmax must be true or false, got {apply_softmax!r}")
         self.apply_softmax = apply_softmax
+        self._set_classes(classes)
         super().__init__(**kwargs)
 
     def _infer(self, preprocessed: torch.Tensor) -> tuple[torch.Tensor, list[Classification]]:
@@ -637,7 +690,33 @@ class TorchDetector(_TorchModelMixin, DetectorBase):
 # --------------------------------------------------------------------- SpeciesNet
 
 
-class SpeciesnetDetector(DetectorBase):
+def _check_speciesnet_args(hf_repo: str | None, preprocessing: Any) -> None:
+    """Reject arguments the SpeciesNet SDK models cannot use, before anything is loaded.
+
+    Raises:
+        NotImplementedError: `hf_repo` was given (it fetches one file; a SpeciesNet model is a folder).
+        TypeError: `preprocessing` is not a mapping.
+        ValueError: `preprocessing` is not empty (the SDK preprocesses images itself).
+    """
+    if hf_repo is not None:
+        raise NotImplementedError(
+            "hf_repo + hf_filename fetch a single file, but a SpeciesNet model is a folder; use "
+            "model_path with a local model folder, a kaggle: id or an hf: id instead"
+        )
+    if preprocessing is not None and not isinstance(preprocessing, Mapping):
+        raise TypeError(f"preprocessing must be a mapping of transform names to kwargs, got {preprocessing!r}")
+    if preprocessing is not None and len(preprocessing) != 0:
+        raise ValueError("SpeciesNet preprocesses images itself; its preprocessing node must be empty")
+
+
+class _SpeciesnetSdkMixin:
+    """Shared by the models wrapping a SpeciesNet SDK component."""
+
+    # The SDK's predict only echoes its filepath into the result; models never see paths.
+    SDK_FILEPATH_PLACEHOLDER = "<in-memory image>"
+
+
+class SpeciesnetDetector(_SpeciesnetSdkMixin, DetectorBase):
     """SpeciesNet's detector component (MegaDetector), returning all boxes with their SDK label.
 
     Labels are `animal`, `human` and `vehicle`. SpeciesNet preprocesses images itself
@@ -651,11 +730,12 @@ class SpeciesnetDetector(DetectorBase):
 
     Args:
         info: See `ModelBase`.
-        model_path: Local SpeciesNet model folder (with `info.json`) or a `kaggle:` id; Kaggle
-            models are downloaded and cached by the SDK. Defaults to SpeciesNet v4.0.3b.
+        model_path: Local SpeciesNet model folder (with `info.json`), a `kaggle:` id or an `hf:` id;
+            the SDK downloads and caches remote models. Defaults to SpeciesNet v4.0.3b.
         preprocessing: Must be empty (`{}` or `None`).
         conf_limit: Minimum box score, in [0.01, 1].
-        hf_repo: Not supported: SpeciesNet is not published on the Hugging Face Hub.
+        hf_repo: Not supported: it fetches one file, but a SpeciesNet model is a folder (use an
+            `hf:` id as `model_path` instead).
         hf_filename: Only valid with `hf_repo`.
         hf_revision: Only valid with `hf_repo`.
         label_map: See `DetectorBase`; keys must be in `LABELS`.
@@ -669,8 +749,6 @@ class SpeciesnetDetector(DetectorBase):
     DEFAULT_MODEL_PATH = "kaggle:google/speciesnet/pyTorch/v4.0.3b/1"
     LABELS = ("animal", "human", "vehicle")  # speciesnet.constants.Detection
     MIN_CONF_LIMIT = 0.01  # the SDK's fixed DETECTION_THRESHOLD
-    # The SDK's predict only echoes its filepath into the result; models never see paths.
-    SDK_FILEPATH_PLACEHOLDER = "<in-memory image>"
 
     def __init__(
         self,
@@ -684,15 +762,7 @@ class SpeciesnetDetector(DetectorBase):
         hf_revision: str | None = None,
         label_map: Mapping[str, str] | None = None,
     ):
-        if hf_repo is not None:
-            raise NotImplementedError(
-                "SpeciesNet is published on Kaggle, not on the Hugging Face Hub; "
-                "use model_path (a local model folder or a kaggle: id) instead of hf_repo"
-            )
-        if preprocessing is not None and not isinstance(preprocessing, Mapping):
-            raise TypeError(f"preprocessing must be a mapping of transform names to kwargs, got {preprocessing!r}")
-        if preprocessing is not None and len(preprocessing) != 0:
-            raise ValueError("SpeciesNet preprocesses images itself; its preprocessing node must be empty")
+        _check_speciesnet_args(hf_repo, preprocessing)
         _validate_conf_limit(conf_limit)  # type check first, so the comparison below is safe
         if conf_limit < self.MIN_CONF_LIMIT:
             raise ValueError(f"SpeciesNet drops boxes below {self.MIN_CONF_LIMIT}; conf_limit must be >= that")
@@ -713,7 +783,11 @@ class SpeciesnetDetector(DetectorBase):
 
     def _load_model(self, weights: str | Path) -> SpeciesNetDetector:
         """Load the SDK detector and force it onto the CPU."""
-        detector = SpeciesNetDetector(str(weights))
+        try:
+            detector = SpeciesNetDetector(str(weights))
+        except KeyError as error:
+            # anticipated: a local model folder whose info.json lacks an entry
+            raise ValueError(f"SpeciesNet model {weights}: info.json lacks {error}") from error
         # The SDK picks cuda/mps/cpu itself and has no device argument; `predict` reads these
         # instance attributes, so setting them is how inference is kept on the CPU. (On a GPU
         # host the checkpoint is briefly loaded onto the GPU before this move.)
@@ -735,34 +809,182 @@ class SpeciesnetDetector(DetectorBase):
         return self._make_detections(xyxy, scores, [d["label"] for d in detections])
 
 
+class SpeciesnetClassifier(_SpeciesnetSdkMixin, ClassifierBase):
+    """SpeciesNet's classifier component on a crop, without geofencing or taxonomic rollup.
+
+    Only crop classifiers (`always_crop` models such as v4.0.3a) are accepted: the pipeline
+    hands over the crop of one detection, which the SDK resizes to 480x480 itself, so
+    `preprocessing` must be present but empty. The taxonomy of each class comes from the
+    model's label file (`uuid;class;order;family;genus;species;common name`), so there is no
+    `classes` argument; empty label fields become `None`. Inference runs on CPU.
+
+    Args:
+        info: See `ModelBase`.
+        model_path: Local SpeciesNet model folder (with `info.json`), a `kaggle:` id or an `hf:` id;
+            the SDK downloads and caches remote models. Defaults to SpeciesNet v4.0.3a.
+        preprocessing: Must be empty (`{}` or `None`).
+        conf_limit: Minimum class probability in [0, 1].
+        hf_repo: Not supported: it fetches one file, but a SpeciesNet model is a folder (use an
+            `hf:` id as `model_path` instead).
+        hf_filename: Only valid with `hf_repo`.
+        hf_revision: Only valid with `hf_repo`.
+
+    Raises:
+        NotImplementedError: `hf_repo` was given.
+        TypeError: `preprocessing` is not a mapping.
+        ValueError: Non-empty preprocessing, a label line that is not a taxonomy, or a model
+            that is not a crop classifier.
+    """
+
+    DEFAULT_MODEL_PATH = "kaggle:google/speciesnet/pyTorch/v4.0.3a/1"
+    CROP_MODEL_TYPE = "always_crop"  # the SDK's model type of crop classifiers
+
+    def __init__(
+        self,
+        *,
+        info: ModelInfo | Mapping[str, Any],
+        preprocessing: Mapping[str, Mapping[str, Any]] | None,
+        conf_limit: float,
+        model_path: str | Path = DEFAULT_MODEL_PATH,
+        hf_repo: str | None = None,
+        hf_filename: str | None = None,
+        hf_revision: str | None = None,
+    ):
+        _check_speciesnet_args(hf_repo, preprocessing)
+        super().__init__(
+            info=info,
+            preprocessing=preprocessing,
+            conf_limit=conf_limit,
+            model_path=model_path,
+            hf_filename=hf_filename,
+            hf_revision=hf_revision,
+        )
+        label_lines = [self.model.labels[index] for index in range(len(self.model.labels))]
+        self._set_classes([_taxon_from_label(line) for line in label_lines])
+        # The SDK reports classes by label line, sorted by score, so lines must be unique (each
+        # starts with its uuid; several taxa do occur twice with different uuids).
+        self._label_index = {line: index for index, line in enumerate(label_lines)}
+        if len(self._label_index) != len(label_lines):
+            raise ValueError(f"the label lines of SpeciesNet model {self.weights} are not unique")
+
+    def _load_model(self, weights: str | Path) -> SpeciesNetClassifier:
+        """Load the SDK classifier on the CPU and check that it classifies crops.
+
+        Raises:
+            ValueError: The model is not a crop classifier (e.g. the `full_image` v4.0.3b).
+        """
+        try:
+            classifier = SpeciesNetClassifier(str(weights), device=self.DEVICE)
+        except KeyError as error:
+            # anticipated: a local model folder whose info.json lacks an entry
+            raise ValueError(f"SpeciesNet model {weights}: info.json lacks {error}") from error
+        model_type = classifier.model_info.type_
+        if model_type != self.CROP_MODEL_TYPE:
+            raise ValueError(
+                f"{weights} is a '{model_type}' SpeciesNet model; classifying crops needs an "
+                f"'{self.CROP_MODEL_TYPE}' model such as {self.DEFAULT_MODEL_PATH}"
+            )
+        return classifier
+
+    def _infer(self, preprocessed: Image.Image) -> tuple[torch.Tensor, list[Classification]]:
+        """Classify the whole crop and return the probabilities in label order."""
+        # The whole crop is the only box: the pipeline already cut the detection out.
+        crops = self.model.preprocess(preprocessed, bboxes=[BBox(xmin=0.0, ymin=0.0, width=1.0, height=1.0)])
+        prediction = self.model.predict(self.SDK_FILEPATH_PLACEHOLDER, crops, num_classes=None)
+        (classification,) = prediction["classifications_list"]
+        probabilities = torch.zeros(len(self._label_index))
+        for line, score in zip(classification["classes"], classification["scores"]):
+            probabilities[self._label_index[line]] = score
+        return probabilities, self._make_classifications(probabilities)
+
+
+def _taxon_from_label(line: str) -> Taxon:
+    """Turn a SpeciesNet label line (`uuid;class;order;family;genus;species;common name`) into a
+    Taxon; empty fields become None, kingdom and phylum are not part of the label.
+
+    Raises:
+        ValueError: The line does not have the seven fields.
+    """
+    fields = line.split(";")
+    if len(fields) != 7:
+        raise ValueError(f"SpeciesNet label lines have 7 ';'-separated fields, got {line!r}")
+    _, class_name, order, family, genus, species, common_name = (field or None for field in fields)
+    return Taxon(
+        class_name=class_name, order=order, family=family, genus=genus, species=species, common_name=common_name
+    )
+
+
 # ---------------------------------------------------------------------- config files
 
 
-def load_model(path: str | Path) -> ModelBase:
-    """Build a model from a YAML config file.
-
-    The required `type` key names the model class; all other keys are its constructor arguments,
-    so missing required keys and unknown keys raise.
+def read_config(path: str | Path) -> dict[str, Any]:
+    """Read a model config file.
 
     Args:
-        path: The config file.
+        path: The YAML config file.
+
+    Returns:
+        Its top-level mapping, including the `type` key.
+
+    Raises:
+        FileNotFoundError: The config file does not exist.
+        UnicodeDecodeError: The file is not UTF-8 text.
+        yaml.YAMLError: The file is not valid YAML.
+        TypeError: The file's top level is not a mapping.
+    """
+    with open(path, encoding="utf-8") as file:
+        config = yaml.safe_load(file)
+    if not isinstance(config, Mapping):
+        raise TypeError(f"config {path} must contain a mapping at the top level")
+    return dict(config)
+
+
+def build_model(config: Mapping[str, Any]) -> ModelBase:
+    """Build a model from a config mapping.
+
+    The required `type` key names the model class; all other keys are its constructor arguments,
+    so missing required keys and unknown keys raise. `config` itself is not changed.
+
+    Args:
+        config: The config, e.g. from `read_config` or uploaded by a client.
 
     Returns:
         The model.
 
     Raises:
-        FileNotFoundError: The config file does not exist.
-        yaml.YAMLError: The file is not valid YAML.
-        TypeError: The file's top level is not a mapping, or it has missing/unknown keys.
+        TypeError: `config` is not a mapping, or it has missing/unknown keys.
         ValueError: `type` is missing or names no model class, or an argument is invalid.
     """
-    with open(path) as file:
-        config = yaml.safe_load(file)
-    if not isinstance(config, Mapping):
-        raise TypeError(f"config {path} must contain a mapping at the top level")
-    kwargs = dict(config)
-    model_class = _model_class(kwargs.pop("type", None))
+    model_class = model_class_of(config)
+    kwargs = {key: value for key, value in config.items() if key != "type"}
     return model_class(**kwargs)
+
+
+def model_class_of(config: Mapping[str, Any]) -> type[ModelBase]:
+    """The model class a config's `type` key names, without building the model.
+
+    Args:
+        config: A config mapping.
+
+    Returns:
+        The model class.
+
+    Raises:
+        TypeError: `config` is not a mapping.
+        ValueError: `type` is missing or names no model class.
+    """
+    if not isinstance(config, Mapping):
+        raise TypeError(f"a model config must be a mapping, got {type(config).__name__}")
+    return _model_class(config.get("type"))
+
+
+def load_model(path: str | Path) -> ModelBase:
+    """Build a model from a YAML config file (`build_model(read_config(path))`).
+
+    Raises:
+        See `read_config` and `build_model`.
+    """
+    return build_model(read_config(path))
 
 
 def _model_class(model_type: Any) -> type[ModelBase]:
@@ -776,10 +998,12 @@ def _model_class(model_type: Any) -> type[ModelBase]:
             return TorchDetector
         case "YoloClassifier":
             return YoloClassifier
+        case "SpeciesnetClassifier":
+            return SpeciesnetClassifier
         case "TorchClassifier":
             return TorchClassifier
         case _:
             raise ValueError(
                 "config key `type` must be one of YoloDetector, SpeciesnetDetector, TorchDetector, "
-                f"YoloClassifier, TorchClassifier; got {model_type!r}"
+                f"YoloClassifier, SpeciesnetClassifier, TorchClassifier; got {model_type!r}"
             )

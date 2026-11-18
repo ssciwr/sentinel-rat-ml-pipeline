@@ -1,8 +1,16 @@
 """Tests for the ML Pipeline HTTP API, run with the tiny service models."""
 
-import pytest
-from fastapi.testclient import TestClient
+import os
+import shutil
+from pathlib import Path
 
+import pytest
+import yaml
+from fastapi.testclient import TestClient
+import httpx2
+from huggingface_hub.errors import LocalEntryNotFoundError
+
+from ml_pipeline.config import settings
 from ml_pipeline.main import app
 from tests.service_support import (
     ANIMAL_BOX,
@@ -13,11 +21,26 @@ from tests.service_support import (
     write_two_colour_image,
 )
 
+CONFIGS_DIR = Path(__file__).parents[1] / "configs"
+
+
+def _fresh_client(monkeypatch, detector_config: Path | None, classifier_config: Path | None) -> TestClient:
+    """A test client of the app without a session, with the given env settings."""
+    monkeypatch.setattr(settings, "DETECTOR_CONFIG", detector_config)
+    monkeypatch.setattr(settings, "CLASSIFIER_CONFIG", classifier_config)
+    monkeypatch.setattr(app.state, "session", None)
+    return TestClient(app)
+
 
 @pytest.fixture
-def client() -> TestClient:
-    """A test client of the app."""
-    return TestClient(app)
+def client(monkeypatch, service_configs) -> TestClient:
+    """A test client of the app without a session, whose env settings name the tiny-model configs."""
+    return _fresh_client(monkeypatch, *service_configs)
+
+
+def _config_values(path: Path) -> dict:
+    """The mapping of a YAML config file, as a client would upload it."""
+    return yaml.safe_load(path.read_text())
 
 
 def test_health_endpoint(client) -> None:
@@ -26,7 +49,10 @@ def test_health_endpoint(client) -> None:
     assert response.json() == {"status": "ok"}
 
 
-def test_analyze_endpoint(client, configured_services, tmp_path) -> None:
+# ------------------------------------------------------------------------------- analyze
+
+
+def test_analyze_endpoint(client, tmp_path) -> None:
     """The response has the README shape: one result per path in order, both models,
     labelled detections, classifications only for animals, and `error` null."""
     paths = [str(write_two_colour_image(tmp_path / name)) for name in ("a.png", "b.png")]
@@ -64,7 +90,7 @@ def test_analyze_endpoint(client, configured_services, tmp_path) -> None:
     assert human["classifications"] == []
 
 
-def test_analyze_endpoint_reports_unreadable_image(client, configured_services, tmp_path) -> None:
+def test_analyze_endpoint_reports_unreadable_image(client, tmp_path) -> None:
     """A missing image gets an error and no detections; the request still succeeds."""
     good = str(write_two_colour_image(tmp_path / "good.png"))
     missing = str(tmp_path / "missing.jpg")
@@ -98,3 +124,334 @@ def test_analyze_endpoint_rejects_empty_list(client) -> None:
 def test_analyze_endpoint_rejects_single_path(client) -> None:
     response = client.post("/api/v1/analyze", json={"image_path": "/fake/a.jpg"})
     assert response.status_code == 422
+
+
+def test_analyze_uses_the_current_session(client, service_configs, tmp_path) -> None:
+    """After a new session with a relabelling detector, /analyze runs the new models: the
+    renamed `animal` boxes are no longer classified."""
+    detector_config, _ = service_configs
+    image = str(write_two_colour_image(tmp_path / "image.png"))
+    uploaded = _config_values(detector_config) | {"label_map": {"animal": "critter"}}
+
+    assert client.post("/api/v1/session", json={"detector": uploaded}).status_code == 200
+    (result,) = client.post("/api/v1/analyze", json={"image_paths": [image]}).json()["results"]
+
+    assert [d["detected_class"] for d in result["detections"]] == ["critter", "human"]
+    assert all(d["classifications"] == [] for d in result["detections"])
+
+
+# ------------------------------------------------------------------------------- session
+
+
+def test_get_session_builds_it_from_the_env_settings_once(client, service_configs) -> None:
+    """The first GET builds the session from the env settings; the next GET shows the same one."""
+    detector_config, classifier_config = service_configs
+
+    first = client.get("/api/v1/session")
+    second = client.get("/api/v1/session")
+
+    assert first.status_code == 200
+    body = first.json()
+    assert set(body) == {"created_at", "models"}
+    detector_card, classifier_card = body["models"]
+    assert detector_card["role"] == "detector"
+    assert detector_card["type"] == "TorchDetector"
+    assert detector_card["info"] == DETECTOR_INFO
+    assert detector_card["source"] == str(detector_config)
+    assert detector_card["labels"] == ["animal", "human"]
+    assert classifier_card["role"] == "classifier"
+    assert classifier_card["type"] == "TorchClassifier"
+    assert classifier_card["info"] == CLASSIFIER_INFO
+    assert classifier_card["source"] == str(classifier_config)
+    assert classifier_card["num_classes"] == 3
+    assert "num_classes" not in detector_card and "labels" not in classifier_card
+    assert second.json() == body
+
+
+@pytest.fixture
+def editable_configs(client, monkeypatch, service_configs, tmp_path) -> tuple[Path, Path]:
+    """Copies of the tiny-model configs that the env settings point to, so tests can edit them.
+
+    Depends on `client`, so it always runs after `client` has set the env settings it overrides.
+    """
+    copies = tuple(Path(shutil.copy(config, tmp_path / config.name)) for config in service_configs)
+    monkeypatch.setattr(settings, "DETECTOR_CONFIG", copies[0])
+    monkeypatch.setattr(settings, "CLASSIFIER_CONFIG", copies[1])
+    return copies
+
+
+def _rename_model(config: Path, name: str) -> None:
+    """Change the `info.name` of a config file."""
+    values = _config_values(config)
+    values["info"]["name"] = name
+    config.write_text(yaml.safe_dump(values))
+
+
+def test_post_session_without_body_rebuilds_both_from_the_env_config_files(client, editable_configs) -> None:
+    """POST without a body re-reads both env config files: edits since the last session show up."""
+    detector_config, classifier_config = editable_configs
+    client.get("/api/v1/session")
+    _rename_model(detector_config, "edited-detector")
+    _rename_model(classifier_config, "edited-classifier")
+
+    response = client.post("/api/v1/session")
+
+    assert response.status_code == 200
+    detector_card, classifier_card = response.json()["models"]
+    assert detector_card["info"]["name"] == "edited-detector"
+    assert classifier_card["info"]["name"] == "edited-classifier"
+    assert client.get("/api/v1/session").json() == response.json()
+
+
+def test_post_session_with_uploaded_config_switches_that_model(client, service_configs, editable_configs) -> None:
+    """An uploaded detector config replaces the detector; the omitted classifier is rebuilt from
+    its env config file."""
+    detector_config, _ = service_configs
+    _, env_classifier_config = editable_configs
+    client.get("/api/v1/session")
+    _rename_model(env_classifier_config, "edited-classifier")
+    uploaded = _config_values(detector_config) | {
+        "info": {"name": "relabelled-detector", "version": "2"},
+        "label_map": {"human": "person"},
+    }
+
+    response = client.post("/api/v1/session", json={"detector": uploaded})
+
+    assert response.status_code == 200
+    detector_card, classifier_card = response.json()["models"]
+    assert detector_card["source"] == "request"
+    assert detector_card["info"]["name"] == "relabelled-detector"
+    assert detector_card["labels"] == ["animal", "person"]
+    assert classifier_card["source"] == str(env_classifier_config)
+    assert classifier_card["info"]["name"] == "edited-classifier"
+
+
+def test_post_session_with_both_configs_needs_no_env(monkeypatch, service_configs) -> None:
+    """With both configs uploaded, the env settings are not needed, even without a session yet."""
+    client = _fresh_client(monkeypatch, None, None)
+    detector_config, classifier_config = service_configs
+
+    response = client.post(
+        "/api/v1/session",
+        json={"detector": _config_values(detector_config), "classifier": _config_values(classifier_config)},
+    )
+
+    assert response.status_code == 200
+    assert [card["source"] for card in response.json()["models"]] == ["request", "request"]
+
+
+def test_post_session_with_hub_config_downloads_the_weights(client, service_configs, monkeypatch) -> None:
+    """An uploaded config with HF Hub arguments loads its weights through hf_hub_download, and
+    the card names the Hub file."""
+    _, classifier_config = service_configs
+    values = _config_values(classifier_config)
+    local_weights = values.pop("model_path")
+    calls = []
+
+    def fake_hf_hub_download(repo_id, filename, revision=None, **kwargs):
+        calls.append((repo_id, filename, revision))
+        return local_weights
+
+    monkeypatch.setattr("ml_pipeline.models.model.hf_hub_download", fake_hf_hub_download)
+    uploaded = values | {"hf_repo": "org/rodent-models", "hf_filename": "cls.pt", "hf_revision": "v1"}
+
+    response = client.post("/api/v1/session", json={"classifier": uploaded})
+
+    assert response.status_code == 200
+    assert calls == [("org/rodent-models", "cls.pt", "v1")]
+    classifier_card = response.json()["models"][1]
+    assert classifier_card["source"] == "request"
+    assert classifier_card["weights"] == "hf:org/rodent-models/cls.pt@v1"
+
+
+def _without(values: dict, key: str) -> dict:
+    """A copy of a config mapping without one key."""
+    return {k: v for k, v in values.items() if k != key}
+
+
+@pytest.mark.parametrize(
+    ("role", "make_config"),
+    [
+        ("detector", lambda det, cls: det | {"type": "ResNet"}),
+        ("detector", lambda det, cls: _without(det, "preprocessing")),
+        ("detector", lambda det, cls: det | {"batch_size": 4}),
+        ("detector", lambda det, cls: det | {"conf_limit": 2.0}),
+        ("detector", lambda det, cls: det | {"model_path": "/nonexistent/detector.pt"}),
+        ("detector", lambda det, cls: cls),
+        ("classifier", lambda det, cls: det),
+    ],
+    ids=[
+        "unknown_type",
+        "missing_key",
+        "unknown_key",
+        "invalid_value",
+        "missing_weights",
+        "classifier_as_detector",
+        "detector_as_classifier",
+    ],
+)
+def test_post_session_with_invalid_config_is_rejected_and_keeps_the_old_session(
+    client, service_configs, role, make_config
+) -> None:
+    """An invalid uploaded config gives 422 with a message; the running session stays."""
+    old = client.get("/api/v1/session").json()
+    uploaded = make_config(*(_config_values(path) for path in service_configs))
+
+    response = client.post("/api/v1/session", json={role: uploaded})
+
+    assert response.status_code == 422
+    assert response.json()["detail"]
+    assert client.get("/api/v1/session").json() == old
+
+
+def test_post_session_with_unknown_role_is_rejected(client, service_configs) -> None:
+    """A misspelled role is a 422, not a silent rebuild from env."""
+    detector_config, _ = service_configs
+    old = client.get("/api/v1/session").json()
+
+    response = client.post("/api/v1/session", json={"detectr": _config_values(detector_config)})
+
+    assert response.status_code == 422
+    assert client.get("/api/v1/session").json() == old
+
+
+def test_post_session_with_unset_env_for_an_omitted_role_is_rejected(client, service_configs, monkeypatch) -> None:
+    """A role without an uploaded config needs its env setting; otherwise 422 naming it."""
+    detector_config, _ = service_configs
+    old = client.get("/api/v1/session").json()
+    monkeypatch.setattr(settings, "CLASSIFIER_CONFIG", None)
+
+    response = client.post("/api/v1/session", json={"detector": _config_values(detector_config)})
+
+    assert response.status_code == 422
+    assert "CLASSIFIER_CONFIG" in response.json()["detail"]
+    assert client.get("/api/v1/session").json() == old
+
+
+@pytest.mark.parametrize(
+    "error",
+    [LocalEntryNotFoundError("cannot reach the Hub and the file is not cached"), httpx2.ReadError("connection lost")],
+    ids=["not_cached", "network"],
+)
+def test_post_session_with_failing_hub_download_is_rejected(client, service_configs, monkeypatch, error) -> None:
+    """Weights that cannot be downloaded give 502; the running session stays."""
+    _, classifier_config = service_configs
+    old = client.get("/api/v1/session").json()
+
+    def offline_hf_hub_download(repo_id, filename, revision=None, **kwargs):
+        raise error
+
+    monkeypatch.setattr("ml_pipeline.models.model.hf_hub_download", offline_hf_hub_download)
+    uploaded = _without(_config_values(classifier_config), "model_path") | {
+        "hf_repo": "org/rodent-models",
+        "hf_filename": "cls.pt",
+    }
+
+    response = client.post("/api/v1/session", json={"classifier": uploaded})
+
+    assert response.status_code == 502
+    assert response.json()["detail"]
+    assert client.get("/api/v1/session").json() == old
+
+
+@pytest.mark.parametrize("variable", ["DETECTOR_CONFIG", "CLASSIFIER_CONFIG"])
+def test_get_session_without_env_setting_is_unavailable_until_set(client, monkeypatch, variable) -> None:
+    """Without a session and an env setting, GET /session answers 503 naming the variable;
+    once it is set, the next request builds the session."""
+    configured = getattr(settings, variable)
+    monkeypatch.setattr(settings, variable, None)
+
+    response = client.get("/api/v1/session")
+    assert response.status_code == 503
+    assert variable in response.json()["detail"]
+
+    monkeypatch.setattr(settings, variable, configured)
+    assert client.get("/api/v1/session").status_code == 200
+
+
+def test_analyze_without_env_setting_is_unavailable(client, monkeypatch, tmp_path) -> None:
+    """/analyze needs the session, too: without a classifier setting it answers 503."""
+    monkeypatch.setattr(settings, "CLASSIFIER_CONFIG", None)
+    image = str(write_two_colour_image(tmp_path / "image.png"))
+
+    response = client.post("/api/v1/analyze", json={"image_paths": [image]})
+
+    assert response.status_code == 503
+    assert "CLASSIFIER_CONFIG" in response.json()["detail"]
+
+
+def test_lazy_session_with_failing_hub_download_is_unavailable_until_it_works(
+    client, service_configs, monkeypatch, tmp_path
+) -> None:
+    """An env config whose Hub download fails makes the lazy build answer 503; once the
+    download works, the next request builds the session."""
+    _, classifier_config = service_configs
+    values = _config_values(classifier_config)
+    local_weights = values.pop("model_path")
+    hub_config = tmp_path / "hub_classifier.yaml"
+    hub_config.write_text(yaml.safe_dump(values | {"hf_repo": "org/rodent-models", "hf_filename": "cls.pt"}))
+    monkeypatch.setattr(settings, "CLASSIFIER_CONFIG", hub_config)
+    hub_reachable = False
+
+    def flaky_hf_hub_download(repo_id, filename, revision=None, **kwargs):
+        if hub_reachable:
+            return local_weights
+        else:
+            raise httpx2.ConnectError("no route to host")
+
+    monkeypatch.setattr("ml_pipeline.models.model.hf_hub_download", flaky_hf_hub_download)
+
+    response = client.get("/api/v1/session")
+    assert response.status_code == 503
+    assert "org/rodent-models" in response.json()["detail"]
+
+    hub_reachable = True
+    assert client.get("/api/v1/session").status_code == 200
+
+
+def test_config_file_that_is_not_utf8_is_unavailable_or_rejected(client, service_configs, monkeypatch, tmp_path):
+    """A config file in another encoding (here Latin-1 with an umlaut) cannot be read: the lazy
+    build answers 503, and POST without a body (re-reading env) answers 422."""
+    detector_config, _ = service_configs
+    latin1_config = tmp_path / "detector_latin1.yaml"
+    latin1_config.write_bytes(detector_config.read_text().replace("fixed", "füxed").encode("latin-1"))
+    monkeypatch.setattr(settings, "DETECTOR_CONFIG", latin1_config)
+
+    lazy = client.get("/api/v1/session")
+    rebuilt = client.post("/api/v1/session")
+
+    assert lazy.status_code == 503
+    assert "UnicodeDecodeError" in lazy.json()["detail"]
+    assert rebuilt.status_code == 422
+
+
+def test_lazy_session_with_missing_config_file_is_unavailable(client, monkeypatch, tmp_path) -> None:
+    """A configured config file that does not exist makes the lazy build fail with 503."""
+    monkeypatch.setattr(settings, "DETECTOR_CONFIG", tmp_path / "missing.yaml")
+    response = client.get("/api/v1/session")
+    assert response.status_code == 503
+    assert response.json()["detail"]
+
+
+# ------------------------------------------------------------------- SpeciesNet (opt-in)
+
+
+@pytest.mark.speciesnet_integration
+def test_speciesnet_baseline_classifies_a_rodent(monkeypatch) -> None:
+    """The shipped baseline configs (SpeciesNet v4.0.3b detector, v4.0.3a crop classifier)
+    find the rodent and classify it as a rodent. Run with RUN_SPECIESNET_INTEGRATION=1."""
+    if os.environ.get("RUN_SPECIESNET_INTEGRATION") != "1":
+        pytest.skip("Set RUN_SPECIESNET_INTEGRATION=1 to run real SpeciesNet inference")
+    client = _fresh_client(
+        monkeypatch, CONFIGS_DIR / "speciesnet_detector.yaml", CONFIGS_DIR / "speciesnet_classifier.yaml"
+    )
+    rodent = str(Path(__file__).parent / "data" / "rodent.jpg")
+
+    response = client.post("/api/v1/analyze", json={"image_paths": [rodent]})
+
+    assert response.status_code == 200
+    (result,) = response.json()["results"]
+    animals = [d for d in result["detections"] if d["detected_class"] == "animal"]
+    assert animals
+    orders = {c["order"] for d in animals for c in d["classifications"]}
+    assert "rodentia" in orders

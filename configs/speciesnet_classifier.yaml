@@ -1,0 +1,12 @@
+# Validation baseline, classification: SpeciesNet's v4.0.3a crop classifier (always_crop) on the
+# detector's crops. Raw classifier output: no geofencing and no taxonomic rollup, so results can
+# differ from SpeciesNet's full ensemble prediction. Taxonomy comes from the model's label file.
+# The SpeciesNet SDK downloads the model from Kaggle on first use.
+type: SpeciesnetClassifier
+info:
+  name: speciesnet-classifier
+  version: v4.0.3a
+  description: SpeciesNet v4.0.3a crop classifier, raw output (no geofencing or rollup)
+model_path: kaggle:google/speciesnet/pyTorch/v4.0.3a/1
+conf_limit: 0.05
+preprocessing: {}

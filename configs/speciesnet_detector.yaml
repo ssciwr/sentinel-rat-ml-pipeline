@@ -1,0 +1,11 @@
+# Validation baseline, detection: SpeciesNet's detector component (MegaDetector v5a) from the
+# v4.0.3b bundle. Finds animals, humans and vehicles; the pipeline crops the animals.
+# The SpeciesNet SDK downloads the model from Kaggle on first use (~770 MB with the detector weights).
+type: SpeciesnetDetector
+info:
+  name: speciesnet-detector
+  version: v4.0.3b
+  description: SpeciesNet v4.0.3b detector component (MegaDetector v5a)
+model_path: kaggle:google/speciesnet/pyTorch/v4.0.3b/1
+conf_limit: 0.1
+preprocessing: {}

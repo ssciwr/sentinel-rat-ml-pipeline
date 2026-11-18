@@ -18,19 +18,27 @@ import numpy as np
 import pytest
 import torch
 import yaml
+import httpx2
+from huggingface_hub.errors import LocalEntryNotFoundError, OfflineModeIsEnabled
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from PIL import Image, ImageOps
 from torchvision.transforms import v2
 
 from ml_pipeline.models.model import (
+    SpeciesnetClassifier,
     SpeciesnetDetector,
     TorchClassifier,
     TorchDetector,
+    WeightsDownloadError,
     YoloClassifier,
     YoloDetector,
+    build_model,
     build_transform,
     load_model,
+    model_class_of,
+    read_config,
+    resolve_weights,
 )
 from ml_pipeline.schemas.analysis import BoundingBox, Classification, Detection, ModelInfo, Taxon
 from tests import tiny_models
@@ -788,6 +796,61 @@ def _classifier_kwargs(model_path: Path) -> dict:
     }
 
 
+def test_read_config_returns_the_mapping(logits_classifier_pt, tmp_path):
+    """read_config parses a YAML config into its mapping, `type` included."""
+    config = {"type": "TorchClassifier"} | _classifier_kwargs(logits_classifier_pt)
+    assert read_config(_write_config(tmp_path / "cls.yaml", config)) == config
+
+
+@pytest.mark.parametrize("content", [["a", "b"], "just a string", 42])
+def test_read_config_non_mapping_top_level_raises(tmp_path, content):
+    """A config file must contain a mapping at the top level."""
+    with pytest.raises(TypeError):
+        read_config(_write_config(tmp_path / "cls.yaml", content))
+
+
+def test_build_model_from_a_mapping(logits_classifier_pt, colour_images):
+    """build_model builds the class named in `type` from an in-memory config, without
+    changing the caller's mapping."""
+    config = {"type": "TorchClassifier"} | _classifier_kwargs(logits_classifier_pt)
+    original = dict(config)
+
+    model = build_model(config)
+
+    assert type(model) is TorchClassifier
+    assert config == original
+    probs, _ = model.predict(colour_images[0])
+    assert probs.shape == (len(TAXA),)
+
+
+@pytest.mark.parametrize("config", [["type", "TorchClassifier"], "TorchClassifier", None])
+def test_build_model_non_mapping_raises(config):
+    """An in-memory config must be a mapping."""
+    with pytest.raises(TypeError):
+        build_model(config)
+
+
+def test_weights_describe_a_local_model_path(logits_classifier_pt):
+    """A model built from a local file names that file as its weights."""
+    assert make_torch_classifier(logits_classifier_pt).weights == str(logits_classifier_pt)
+
+
+@pytest.mark.parametrize(
+    ("model_type", "model_class"),
+    [("TorchDetector", TorchDetector), ("SpeciesnetClassifier", SpeciesnetClassifier), ("YoloDetector", YoloDetector)],
+)
+def test_model_class_of_names_the_class_without_building(model_type, model_class):
+    """The class a config names is known without loading anything (the other keys may be invalid)."""
+    assert model_class_of({"type": model_type, "model_path": "/nonexistent.pt"}) is model_class
+
+
+@pytest.mark.parametrize(("config", "error"), [({}, ValueError), ({"type": "ResNet"}, ValueError), ([], TypeError)])
+def test_model_class_of_rejects_unknown_or_missing_types(config, error):
+    """A config without a known `type` (or no mapping at all) names no class."""
+    with pytest.raises(error):
+        model_class_of(config)
+
+
 def test_load_model_matches_keyword_construction(logits_classifier_pt, colour_images, tmp_path):
     """A model loaded from a config file is of the class named in `type` and predicts exactly
     like one built from the same kwargs."""
@@ -842,7 +905,7 @@ def test_load_model_with_null_preprocessing_node(logits_classifier_pt, colour_im
 
 @pytest.mark.parametrize("model_type", [None, "ResNet", "torchclassifier", "ModelBase", 3])
 def test_load_model_unknown_or_missing_type_raises(logits_classifier_pt, tmp_path, model_type):
-    """`type` must name one of the five model classes exactly."""
+    """`type` must name one of the model classes exactly."""
     config = _classifier_kwargs(logits_classifier_pt)
     if model_type is not None:
         config["type"] = model_type
@@ -867,13 +930,6 @@ def test_load_model_unknown_key_raises(logits_classifier_pt, tmp_path, extra):
         load_model(_write_config(tmp_path / "cls.yaml", config))
 
 
-@pytest.mark.parametrize("content", [["a", "b"], "just a string", 42])
-def test_load_model_non_mapping_top_level_raises(tmp_path, content):
-    """A config file must contain a mapping at the top level."""
-    with pytest.raises(TypeError):
-        load_model(_write_config(tmp_path / "cls.yaml", content))
-
-
 # ------------------------------------------------------------------ Hugging Face Hub
 
 
@@ -890,9 +946,57 @@ def hub_stub(monkeypatch, logits_classifier_pt):
     return calls
 
 
-@pytest.mark.parametrize("revision", [None, "v1.2"])
-def test_hf_download_is_used_and_loaded(hub_stub, colour_images, revision):
-    """HF args are forwarded to hf_hub_download and the downloaded file is loaded."""
+@pytest.mark.parametrize(
+    "error",
+    [
+        LocalEntryNotFoundError("not cached and the Hub is unreachable"),
+        OfflineModeIsEnabled("HF_HUB_OFFLINE is set"),
+        OSError("connection reset"),
+        httpx2.ReadError("connection closed while reading"),
+        httpx2.ProxyError("proxy refused the connection"),
+    ],
+    ids=["not_cached", "offline", "network", "read_error", "proxy_error"],
+)
+def test_failing_hub_download_raises_weights_download_error(monkeypatch, error):
+    """Download failures (huggingface_hub's OSErrors and httpx2's network errors) become
+    WeightsDownloadError, which is not an OSError, so they cannot be mistaken for config errors
+    such as a missing local file."""
+
+    def failing_hf_hub_download(repo_id, filename, revision=None, **kwargs):
+        raise error
+
+    monkeypatch.setattr("ml_pipeline.models.model.hf_hub_download", failing_hf_hub_download)
+    with pytest.raises(WeightsDownloadError) as excinfo:
+        resolve_weights(None, "org/rodent-models", "cls.pt", None)
+    assert excinfo.value.__cause__ is error
+    assert not issubclass(WeightsDownloadError, OSError)
+
+
+@pytest.mark.parametrize(
+    "content", [b"not a pickle at all", b"", b'{"weights": [1, 2, 3]}'], ids=["garbage", "empty", "json"]
+)
+def test_weights_that_are_no_torch_pickle_raise_value_error(tmp_path, content):
+    """A weights file that torch.load cannot unpickle (safetensors, JSON, a truncated download) is
+    an invalid config: ValueError naming the file."""
+    path = tmp_path / "weights.pt"
+    path.write_bytes(content)
+    with pytest.raises(ValueError, match="weights.pt"):
+        make_torch_classifier(path)
+
+
+def test_missing_local_weights_stay_a_file_not_found_error(tmp_path):
+    """A missing local weights file is a config error (FileNotFoundError), not a download error."""
+    with pytest.raises(FileNotFoundError):
+        make_torch_classifier(tmp_path / "missing.pt")
+
+
+@pytest.mark.parametrize(
+    ("revision", "weights"),
+    [(None, "hf:org/rodent-models/weights/classifier.pt"), ("v1.2", "hf:org/rodent-models/weights/classifier.pt@v1.2")],
+)
+def test_hf_download_is_used_and_loaded(hub_stub, colour_images, revision, weights):
+    """HF args are forwarded to hf_hub_download, the downloaded file is loaded, and the model
+    names repo, file and (if given) revision as its weights."""
     model = TorchClassifier(
         info=INFO,
         hf_repo="org/rodent-models",
@@ -904,6 +1008,7 @@ def test_hf_download_is_used_and_loaded(hub_stub, colour_images, revision):
         apply_softmax=True,
     )
     assert hub_stub == [{"repo_id": "org/rodent-models", "filename": "weights/classifier.pt", "revision": revision}]
+    assert model.weights == weights
     probs, _ = model.predict(colour_images[0])
     assert probs.shape == (len(TAXA),)
 
@@ -912,7 +1017,7 @@ def test_hf_download_is_used_and_loaded(hub_stub, colour_images, revision):
     "bad_args",
     [
         {"preprocessing": {"no_such_transform": {}}},
-        {"classes": [{"species": "rattus"}]},  # genus is required
+        {"classes": [{"genus": ["Rattus"]}]},  # genus must be a string
         {"classes": [{"genus": "Rattus", "specis": "norvegicus"}]},  # misspelled key
         {"classes": []},  # a classifier needs at least one class
     ],
@@ -1328,7 +1433,7 @@ def test_speciesnet_runs_on_cpu(speciesnet_stub):
 
 
 def test_speciesnet_hub_download_not_implemented(speciesnet_stub, hub_stub):
-    """SpeciesNet is not published on the Hugging Face Hub."""
+    """hf_repo/hf_filename fetch one file, but a SpeciesNet model is a folder."""
     with pytest.raises(NotImplementedError):
         SpeciesnetDetector(
             info=INFO, hf_repo="org/speciesnet", hf_filename="model.pt", preprocessing={}, conf_limit=0.1
@@ -1371,6 +1476,279 @@ def test_speciesnet_accepts_empty_preprocessing(speciesnet_stub, preprocessing):
     """An empty preprocessing node, `{}` or YAML null, is accepted."""
     SpeciesnetDetector(info=INFO, preprocessing=preprocessing, conf_limit=0.1)
     assert len(speciesnet_stub.instances) == 1
+
+
+def test_speciesnet_weights_name_the_default_model(speciesnet_stub):
+    """Without model_path, the weights are the pinned default Kaggle model."""
+    assert SpeciesnetDetector(info=INFO, preprocessing={}, conf_limit=0.1).weights == SPECIESNET_V403B
+
+
+# ------------------------------------------------------- SpeciesNet classifier (stub)
+
+SPECIESNET_V403A = "kaggle:google/speciesnet/pyTorch/v4.0.3a/1"
+
+# SDK label lines: uuid;class;order;family;genus;species;common name. As in the real label file,
+# two labels (u0, u3) differ only in their uuid, and one (u4) has no common name.
+SPECIESNET_LABELS = [
+    "u0;mammalia;rodentia;sciuridae;;;sciuridae family",
+    "u1;mammalia;rodentia;muridae;rattus;norvegicus;brown rat",
+    "u2;;;;;;blank",
+    "u3;mammalia;rodentia;sciuridae;;;sciuridae family",
+    "u4;aves;passeriformes;;;;",
+]
+SCIURIDAE = Taxon(class_name="mammalia", order="rodentia", family="sciuridae", common_name="sciuridae family")
+SPECIESNET_TAXA = [
+    SCIURIDAE,
+    Taxon(
+        class_name="mammalia",
+        order="rodentia",
+        family="muridae",
+        genus="rattus",
+        species="norvegicus",
+        common_name="brown rat",
+    ),
+    Taxon(common_name="blank"),
+    SCIURIDAE,
+    Taxon(class_name="aves", order="passeriformes"),
+]
+# by label index; the SDK reports them sorted by score (1, 3, 0, 4, 2), so index order must be restored
+SPECIESNET_SCORES = [0.15, 0.4, 0.05, 0.3, 0.1]
+
+
+def make_speciesnet_classifier_stub(
+    model_type: str = "always_crop", labels: list[str] | None = None, scores: list[float] | None = None
+):
+    """Create a stand-in for `speciesnet.classifier.SpeciesNetClassifier`.
+
+    It mimics the SDK surface used by the pipeline: construction from a model name with a
+    `device` argument, `model_info.type_`, the `labels` index -> label line mapping,
+    `preprocess(PIL image, bboxes)` returning one marker per box, and
+    `predict(filepath, preprocessed, num_classes)` returning SDK-shaped classifications (labels
+    and scores sorted by score). Instances record the bboxes, filepaths and num_classes they got.
+    `labels` and `scores` default to SPECIESNET_LABELS / SPECIESNET_SCORES.
+    """
+    labels = SPECIESNET_LABELS if labels is None else labels
+    scores = SPECIESNET_SCORES if scores is None else scores
+    instances = []
+
+    class Preprocessed:
+        """Marker for one crop produced by the stub's `preprocess`."""
+
+        def __init__(self, image, bbox):
+            self.image = image
+            self.bbox = bbox
+
+    class StubModelInfo:
+        """The SDK's ModelInfo, reduced to the model type."""
+
+        type_ = model_type
+
+    class StubSpeciesNetClassifier:
+        """Stand-in for the SDK classifier component."""
+
+        def __init__(self, model_name, target_species_txt=None, device=None, force_model_download=False):
+            self.model_name = model_name
+            self.device = device
+            self.model_info = StubModelInfo()
+            self.labels = dict(enumerate(labels))
+            self.bboxes = []
+            self.filepaths = []
+            self.num_classes = []
+            instances.append(self)
+
+        def preprocess(self, img, bboxes=None, resize=True):
+            """Accept only RGB PIL images; return one crop per box, as `always_crop` does."""
+            assert isinstance(img, Image.Image) and img.mode == "RGB"
+            self.bboxes.append(list(bboxes or []))
+            return [Preprocessed(img, bbox) for bbox in bboxes or []]
+
+        def predict(self, filepath, imgs, num_classes=5):
+            """Return the scores of every crop, sorted by score like the SDK."""
+            assert imgs and all(isinstance(img, Preprocessed) for img in imgs)
+            self.filepaths.append(filepath)
+            self.num_classes.append(num_classes)
+            order = sorted(range(len(labels)), key=lambda i: scores[i], reverse=True)
+            if num_classes is not None:
+                order = order[:num_classes]
+            classification = {"classes": [labels[i] for i in order], "scores": [scores[i] for i in order]}
+            return {"filepath": filepath, "classifications_list": [classification for _ in imgs]}
+
+    StubSpeciesNetClassifier.instances = instances
+    return StubSpeciesNetClassifier
+
+
+@pytest.fixture
+def speciesnet_classifier_stub(monkeypatch):
+    """Install a SpeciesNet classifier stub for an `always_crop` model."""
+    stub = make_speciesnet_classifier_stub()
+    monkeypatch.setattr("ml_pipeline.models.model.SpeciesNetClassifier", stub)
+    return stub
+
+
+def make_speciesnet_classifier(**overrides) -> SpeciesnetClassifier:
+    """Build a SpeciesnetClassifier with test defaults, overridable per test."""
+    kwargs = {"info": INFO, "preprocessing": {}, "conf_limit": 0.1} | overrides
+    return SpeciesnetClassifier(**kwargs)
+
+
+def test_speciesnet_classifier_taxonomy_comes_from_the_labels(speciesnet_classifier_stub):
+    """Each label line becomes a Taxon; empty fields (no genus, no common name, no taxonomy at
+    all) are None."""
+    assert make_speciesnet_classifier().classes == SPECIESNET_TAXA
+
+
+def test_speciesnet_classifier_returns_probabilities_in_label_order(speciesnet_classifier_stub, colour_images):
+    """The probability vector follows the label index, not the SDK's score order, also for labels
+    that differ only in their uuid; the payload holds the classes >= conf_limit, sorted, with
+    their taxonomy."""
+    probs, classifications = make_speciesnet_classifier(conf_limit=0.1).predict(colour_images[0])
+
+    assert probs.tolist() == pytest.approx(SPECIESNET_SCORES)
+    assert [c.confidence for c in classifications] == pytest.approx([0.4, 0.3, 0.15, 0.1])
+    assert [c.model_dump(exclude={"confidence"}) for c in classifications] == [
+        SPECIESNET_TAXA[1].model_dump(),
+        SCIURIDAE.model_dump(),
+        SCIURIDAE.model_dump(),
+        SPECIESNET_TAXA[4].model_dump(),
+    ]
+    _assert_ordinary_tensor(probs)
+
+
+@st.composite
+def labelled_scores(draw):
+    """SDK label lines (unique uuids, taxa repeating so some differ only by uuid) and float32 scores."""
+    count = draw(st.integers(min_value=1, max_value=8))
+    labels = [f"u{i};mammalia;rodentia;muridae;genus{i % 3};;name{i % 3}" for i in range(count)]
+    scores = draw(st.lists(st.floats(0.0, 1.0, width=32), min_size=count, max_size=count))
+    return labels, scores
+
+
+@PROPERTY_SETTINGS
+@given(case=labelled_scores(), conf_limit=st.floats(0.0, 1.0, width=32))
+def test_speciesnet_classifier_reorders_and_filters_any_scores(colour_images, case, conf_limit):
+    """For any labels and scores (ties included): the probability vector is the scores in label
+    order, and the classifications are exactly the scores >= conf_limit, descending, each with
+    the taxonomy of its own label. The SDK's softmax scores are taken as given, so the drawn
+    scores need not sum to 1."""
+    labels, scores = case
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            "ml_pipeline.models.model.SpeciesNetClassifier",
+            make_speciesnet_classifier_stub(labels=labels, scores=scores),
+        )
+        probs, classifications = make_speciesnet_classifier(conf_limit=conf_limit).predict(colour_images[0])
+
+    assert probs.tolist() == pytest.approx(scores)
+    expected = sorted((score for score in scores if score >= conf_limit), reverse=True)
+    assert [c.confidence for c in classifications] == pytest.approx(expected)
+    # taxonomy per label (as a multiset: the order between tied scores is open)
+    expected_pairs = sorted(
+        (label.split(";")[4], score) for label, score in zip(labels, scores) if score >= conf_limit
+    )
+    assert sorted((c.genus, c.confidence) for c in classifications) == pytest.approx(expected_pairs)
+
+
+def test_speciesnet_classifier_asks_for_all_classes_of_the_whole_crop(speciesnet_classifier_stub, colour_images):
+    """The SDK gets the whole crop as its only box, every class's score, and the placeholder
+    filepath (models receive no paths)."""
+    make_speciesnet_classifier().predict(colour_images[0])
+    sdk = speciesnet_classifier_stub.instances[-1]
+
+    ((bbox,),) = sdk.bboxes
+    assert (bbox.xmin, bbox.ymin, bbox.width, bbox.height) == (0.0, 0.0, 1.0, 1.0)
+    assert sdk.num_classes == [None]
+    assert sdk.filepaths == [SpeciesnetClassifier.SDK_FILEPATH_PLACEHOLDER]
+
+
+def test_speciesnet_classifier_runs_on_cpu_with_the_default_model(speciesnet_classifier_stub):
+    """The SDK gets device="cpu" and, without model_path, the pinned v4.0.3a crop classifier."""
+    model = make_speciesnet_classifier()
+    sdk = speciesnet_classifier_stub.instances[-1]
+    assert sdk.device == "cpu"
+    assert sdk.model_name == SPECIESNET_V403A
+    assert model.weights == SPECIESNET_V403A
+
+
+def test_speciesnet_classifier_passes_model_path_unchanged(speciesnet_classifier_stub):
+    """A configured model folder or Kaggle id reaches the SDK as given."""
+    model = make_speciesnet_classifier(model_path="./models/speciesnet/")
+    assert speciesnet_classifier_stub.instances[-1].model_name == "./models/speciesnet/"
+    assert model.weights == "./models/speciesnet/"
+
+
+def test_speciesnet_classifier_rejects_malformed_label_lines(monkeypatch):
+    """A label file whose lines are not `uuid;class;order;family;genus;species;common name` is an error."""
+    monkeypatch.setattr(
+        "ml_pipeline.models.model.SpeciesNetClassifier",
+        make_speciesnet_classifier_stub(labels=["u0;mammalia;rodentia"], scores=[1.0]),
+    )
+    with pytest.raises(ValueError, match="7"):
+        make_speciesnet_classifier()
+
+
+def test_speciesnet_classifier_rejects_duplicate_label_lines(monkeypatch):
+    """Scores are matched to classes by label line, so lines must be unique."""
+    duplicated = "u0;mammalia;rodentia;muridae;rattus;rattus;house rat"
+    monkeypatch.setattr(
+        "ml_pipeline.models.model.SpeciesNetClassifier",
+        make_speciesnet_classifier_stub(labels=[duplicated, duplicated], scores=[0.5, 0.5]),
+    )
+    with pytest.raises(ValueError, match="unique"):
+        make_speciesnet_classifier()
+
+
+def _incomplete_info_json(*args, **kwargs):
+    """Stand-in for an SDK constructor reading a local model folder whose info.json lacks a key."""
+    raise KeyError("classifier_labels")
+
+
+@pytest.mark.parametrize(
+    ("sdk_class", "make_model"),
+    [
+        ("SpeciesNetDetector", lambda: SpeciesnetDetector(info=INFO, preprocessing={}, conf_limit=0.1)),
+        ("SpeciesNetClassifier", make_speciesnet_classifier),
+    ],
+)
+def test_speciesnet_with_incomplete_info_json_raises_value_error(monkeypatch, sdk_class, make_model):
+    """A SpeciesNet model folder with an incomplete info.json is an invalid config (ValueError)."""
+    monkeypatch.setattr(f"ml_pipeline.models.model.{sdk_class}", _incomplete_info_json)
+    with pytest.raises(ValueError, match="info.json"):
+        make_model()
+
+
+def test_speciesnet_classifier_rejects_whole_image_models(monkeypatch):
+    """A `full_image` model (v4.0.3b) expects whole images, not crops: rejected at construction."""
+    monkeypatch.setattr("ml_pipeline.models.model.SpeciesNetClassifier", make_speciesnet_classifier_stub("full_image"))
+    with pytest.raises(ValueError, match="full_image"):
+        make_speciesnet_classifier(model_path="kaggle:google/speciesnet/pyTorch/v4.0.3b/1")
+
+
+def test_speciesnet_classifier_hub_download_not_implemented(speciesnet_classifier_stub, hub_stub):
+    """hf_repo/hf_filename fetch one file, but a SpeciesNet model is a folder."""
+    with pytest.raises(NotImplementedError):
+        make_speciesnet_classifier(hf_repo="org/speciesnet", hf_filename="model.pt")
+    assert hub_stub == []
+
+
+@pytest.mark.parametrize(
+    ("bad_args", "error"),
+    [
+        ({"preprocessing": {"resize": {"size": [16, 16]}}}, ValueError),
+        ({"classes": TAXA}, TypeError),
+        ({"conf_limit": 1.5}, ValueError),
+    ],
+)
+def test_speciesnet_classifier_invalid_settings_raise(speciesnet_classifier_stub, bad_args, error):
+    """SpeciesNet preprocesses itself and brings its own taxonomy; checked before loading."""
+    with pytest.raises(error):
+        make_speciesnet_classifier(**bad_args)
+    assert speciesnet_classifier_stub.instances == []
+
+
+def test_load_model_builds_the_speciesnet_classifier(speciesnet_classifier_stub, tmp_path):
+    """`type: SpeciesnetClassifier` builds the SDK-backed classifier."""
+    config = {"type": "SpeciesnetClassifier", "info": INFO, "preprocessing": {}, "conf_limit": 0.05}
+    assert type(load_model(_write_config(tmp_path / "speciesnet_cls.yaml", config))) is SpeciesnetClassifier
 
 
 # -------------------------------------------------------- SpeciesNet (real, opt-in)
