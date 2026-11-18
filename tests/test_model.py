@@ -1,13 +1,14 @@
 """Behavioural tests for the model handling module (`ml_pipeline.models.model`).
 
-Test layout follows planning/plan_model_handling.md, section 4:
+Layout follows the plan's test section:
 - torch models: real pickled `.pt` files of tiny modules (tests/tiny_models.py)
 - YOLO: the pretrained default models, downloaded once into the pytest cache
 - SpeciesNet: an SDK stub (CI must not download the ~500 MB Kaggle model), plus an opt-in
   real-model test (`RUN_SPECIESNET_INTEGRATION=1`)
+
+Models take one in-memory RGB PIL image per `predict` call; loading files is the service's job.
 """
 
-import json
 import os
 import socket
 import sys
@@ -20,7 +21,6 @@ import yaml
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from PIL import Image, ImageOps
-from pydantic import ValidationError
 from torchvision.transforms import v2
 
 from ml_pipeline.models.model import (
@@ -30,12 +30,14 @@ from ml_pipeline.models.model import (
     YoloClassifier,
     YoloDetector,
     build_transform,
-    load_image,
+    load_model,
 )
-from ml_pipeline.schemas.analysis import BoundingBox, Classification, Taxon
+from ml_pipeline.schemas.analysis import BoundingBox, Classification, Detection, ModelInfo, Taxon
 from tests import tiny_models
 
 PROPERTY_SETTINGS = settings(deadline=None, max_examples=25)
+
+INFO = {"name": "tiny-model", "version": "0", "description": "test model"}
 
 TAXA = [
     {
@@ -70,11 +72,12 @@ TAXA = [
     },
 ]
 
+DETECTOR_LABELS = ["animal", "human", "vehicle"]
 DETECTOR_ROWS = [
-    [0.1, 0.2, 0.4, 0.5, 0.6],
-    [0.2, 0.1, 0.9, 0.8, 0.95],
-    [0.3, 0.3, 0.6, 0.6, 0.05],
-    [-1.0, -1.0, -1.0, -1.0, 0.0],  # padding: score 0, arbitrary (even invalid) box
+    [0.1, 0.2, 0.4, 0.5, 0.6, 0.0],
+    [0.2, 0.1, 0.9, 0.8, 0.95, 1.0],
+    [0.3, 0.3, 0.6, 0.6, 0.05, 2.0],
+    [-1.0, -1.0, -1.0, -1.0, 0.0, -5.0],  # padding: score 0, arbitrary (even invalid) box and class
 ]
 
 SPECIESNET_V403B = "kaggle:google/speciesnet/pyTorch/v4.0.3b/1"
@@ -87,28 +90,15 @@ SPECIESNET_FLOOR_F32 = float(np.nextafter(np.float32(0.01), np.float32(1.0)))
 
 @pytest.fixture(scope="session")
 def data_dir(tmp_path_factory) -> Path:
-    """Session-wide directory for generated images and pickled models."""
+    """Session-wide directory for pickled models."""
     return tmp_path_factory.mktemp("model_data")
 
 
 @pytest.fixture(scope="session")
-def colour_images(data_dir) -> list[Path]:
+def colour_images() -> list[Image.Image]:
     """Six 32x32 RGB images of distinct uniform colours, so model outputs differ per image."""
     colours = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (0, 255, 255), (40, 40, 40)]
-    paths = []
-    for index, colour in enumerate(colours):
-        path = data_dir / f"colour_{index}.png"
-        Image.new("RGB", (32, 32), colour).save(path)
-        paths.append(path)
-    return paths
-
-
-@pytest.fixture(scope="session")
-def odd_size_image(data_dir) -> Path:
-    """An image whose size differs from the colour images."""
-    path = data_dir / "odd_size.png"
-    Image.new("RGB", (48, 40), (10, 200, 30)).save(path)
-    return path
+    return [Image.new("RGB", (32, 32), colour) for colour in colours]
 
 
 def _save_module(module: object, path: Path) -> Path:
@@ -122,6 +112,12 @@ def _seeded(seed: int, build):
     with torch.random.fork_rng():
         torch.manual_seed(seed)
         return build()
+
+
+def _open_rgb(path: Path) -> Image.Image:
+    """Open an image file as an EXIF-transposed RGB image (the service's job in production)."""
+    with Image.open(path) as image:
+        return ImageOps.exif_transpose(image).convert("RGB")
 
 
 @pytest.fixture(scope="session")
@@ -150,15 +146,10 @@ def colour_detector_pt(data_dir) -> Path:
     return _save_module(tiny_models.ColourDetector(), data_dir / "colour_detector.pt")
 
 
-@pytest.fixture(scope="session")
-def batch_probe_pt(data_dir) -> Path:
-    """Tiny classifier whose output reveals the batch size it was called with."""
-    return _save_module(tiny_models.BatchSizeProbe(PROBE_WIDTH), data_dir / "batch_probe.pt")
-
-
 def make_torch_classifier(model_path: Path, **overrides) -> TorchClassifier:
     """Build a TorchClassifier with test defaults, overridable per test."""
     kwargs = {
+        "info": INFO,
         "model_path": model_path,
         "preprocessing": {},
         "conf_limit": 0.0,
@@ -171,7 +162,13 @@ def make_torch_classifier(model_path: Path, **overrides) -> TorchClassifier:
 
 def make_torch_detector(model_path: Path, **overrides) -> TorchDetector:
     """Build a TorchDetector with test defaults, overridable per test."""
-    kwargs = {"model_path": model_path, "preprocessing": {}, "conf_limit": 0.0}
+    kwargs = {
+        "info": INFO,
+        "model_path": model_path,
+        "preprocessing": {},
+        "conf_limit": 0.0,
+        "labels": DETECTOR_LABELS,
+    }
     kwargs.update(overrides)
     return TorchDetector(**kwargs)
 
@@ -207,107 +204,41 @@ def assert_classifier_payload(
         assert classification.model_dump(exclude={"confidence"}) == Taxon(**taxa[index]).model_dump()
 
 
-def assert_detector_payload(scores: torch.Tensor, boxes: list[BoundingBox], conf_limit: float) -> None:
-    """Shared detector invariants for one image: CPU scores aligned with BoundingBoxes, sorted
-    descending, all >= conf_limit, boxes in relative coordinates with min <= max."""
+def assert_detector_payload(scores: torch.Tensor, detections: list[Detection], conf_limit: float) -> None:
+    """Shared detector invariants for one image: CPU scores aligned with unclassified
+    Detections, sorted descending, all >= conf_limit, boxes relative with min <= max."""
     assert scores.device.type == "cpu"
-    assert len(scores) == len(boxes)
+    assert scores.ndim == 1
+    assert len(scores) == len(detections)
     assert scores.tolist() == sorted(scores.tolist(), reverse=True)
-    assert all(score >= conf_limit for score in scores.tolist())
-    for box in boxes:
-        assert isinstance(box, BoundingBox)
-        assert 0.0 <= box.x_min <= box.x_max <= 1.0
-        assert 0.0 <= box.y_min <= box.y_max <= 1.0
+    for score, detection in zip(scores.tolist(), detections):
+        assert isinstance(detection, Detection)
+        assert detection.confidence == pytest.approx(score)
+        assert detection.confidence >= conf_limit
+        assert detection.classifications == []
+        assert isinstance(detection.bbox, BoundingBox)
+        assert 0.0 <= detection.bbox.x_min <= detection.bbox.x_max <= 1.0
+        assert 0.0 <= detection.bbox.y_min <= detection.bbox.y_max <= 1.0
 
 
-PROBE_WIDTH = 8
-PROBE_TAXA = placeholder_taxa(PROBE_WIDTH)
+def _box_coords(detections: list[Detection]) -> list[float]:
+    """Corners of all boxes as one flat list (pytest.approx does not compare nested tuples)."""
+    return [c for d in detections for c in (d.bbox.x_min, d.bbox.y_min, d.bbox.x_max, d.bbox.y_max)]
 
 
 # ------------------------------------------------------------------- torch classifier
 
 
 def test_torch_classifier_runs_in_eval_mode(logits_classifier_pt, colour_images):
-    """Dropout is inactive: repeated predictions are identical."""
+    """Dropout is inactive: predictions equal the eval-mode module's softmax output."""
     model = make_torch_classifier(logits_classifier_pt)
-    first, _ = model.predict(colour_images)
-    second, _ = model.predict(colour_images)
-    for a, b in zip(first, second):
-        assert torch.equal(a, b)
-
-
-@pytest.fixture(scope="session")
-def single_image_references(logits_classifier_pt, colour_detector_pt, colour_images):
-    """Per-image results of one-image predict calls, as the reference for batched calls."""
-    classifier = make_torch_classifier(logits_classifier_pt)
-    detector = make_torch_detector(colour_detector_pt)
-    classifier_probs = [classifier.predict([path])[0][0] for path in colour_images]
-    detector_results = [detector.predict([path]) for path in colour_images]
-    detector_scores = [scores[0] for scores, _ in detector_results]
-    detector_boxes = [boxes[0] for _, boxes in detector_results]
-    return classifier_probs, detector_scores, detector_boxes
-
-
-def _box_coords(boxes: list[BoundingBox]) -> list[float]:
-    """Corners of all boxes as one flat list (pytest.approx does not compare nested tuples)."""
-    return [coord for b in boxes for coord in (b.x_min, b.y_min, b.x_max, b.y_max)]
-
-
-@PROPERTY_SETTINGS
-@given(
-    indices=st.lists(st.integers(min_value=0, max_value=5), max_size=7),
-    batch_size=st.one_of(st.none(), st.integers(min_value=1, max_value=8)),
-    as_str=st.booleans(),
-)
-def test_torch_predict_returns_one_entry_per_path_in_order(
-    logits_classifier_pt, colour_detector_pt, colour_images, single_image_references,
-    indices, batch_size, as_str,
-):
-    """Any number of paths (str or Path) and any batch size (incl. None and a short last
-    chunk) give per-path results in input order that match single-image predictions,
-    for classifiers and for detectors whose rows differ per image."""
-    expected_probs, expected_scores, expected_boxes = single_image_references
-    paths = [str(colour_images[i]) if as_str else colour_images[i] for i in indices]
-
-    classifier = make_torch_classifier(logits_classifier_pt, batch_size=batch_size)
-    probabilities, payload = classifier.predict(paths)
-    assert len(probabilities) == len(payload) == len(indices)
-    for index, probs in zip(indices, probabilities):
-        assert torch.allclose(probs, expected_probs[index], atol=1e-6)
-
-    detector = make_torch_detector(colour_detector_pt, batch_size=batch_size)
-    scores, boxes = detector.predict(paths)
-    assert len(scores) == len(boxes) == len(indices)
-    for index, image_scores, image_boxes in zip(indices, scores, boxes):
-        assert torch.allclose(image_scores, expected_scores[index], atol=1e-6)
-        assert _box_coords(image_boxes) == pytest.approx(_box_coords(expected_boxes[index]), abs=1e-6)
-
-
-@PROPERTY_SETTINGS
-@given(
-    count=st.integers(min_value=1, max_value=7),
-    batch_size=st.one_of(st.none(), st.integers(min_value=1, max_value=PROBE_WIDTH)),
-)
-def test_torch_batches_honour_batch_size(batch_probe_pt, colour_images, count, batch_size):
-    """The module sees chunks of batch_size images (the last one may be shorter); without
-    batch_size it sees all images of the predict call at once."""
-    model = TorchClassifier(
-        model_path=batch_probe_pt,
-        preprocessing={},
-        conf_limit=0.5,
-        classes=PROBE_TAXA,
-        apply_softmax=False,
-        batch_size=batch_size,
-    )
-    probabilities, _ = model.predict([colour_images[i % len(colour_images)] for i in range(count)])
-    observed = [int(probs.argmax()) + 1 for probs in probabilities]
-
-    if batch_size is None:
-        expected = [count] * count
-    else:
-        full_chunks, remainder = divmod(count, batch_size)
-        expected = [batch_size] * (full_chunks * batch_size) + [remainder] * remainder
-    assert observed == expected
+    raw = torch.load(logits_classifier_pt, weights_only=False).eval()
+    to_input = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32, scale=True)])
+    for image in colour_images:
+        probs, _ = model.predict(image)
+        with torch.inference_mode():
+            expected = torch.softmax(raw(to_input(image).unsqueeze(0)), dim=1)[0]
+        assert torch.allclose(probs, expected, atol=1e-6)
 
 
 @PROPERTY_SETTINGS
@@ -316,23 +247,20 @@ def test_torch_classifier_payload_invariants(logits_classifier_pt, colour_images
     """Payload: sorted descending, all >= conf_limit, taxonomy matches the output index,
     complete w.r.t. conf_limit; softmax-ed probability vectors sum to 1."""
     model = make_torch_classifier(logits_classifier_pt, conf_limit=conf_limit)
-    probabilities, payload = model.predict(colour_images)
-
-    for probs, classifications in zip(probabilities, payload):
+    for image in colour_images:
+        probs, classifications = model.predict(image)
         assert_classifier_payload(probs, classifications, TAXA, conf_limit, sum_atol=1e-5)
 
 
-def test_torch_classifier_accepts_probabilities_without_softmax(
-    probability_classifier_pt, colour_images
-):
+def test_torch_classifier_accepts_probabilities_without_softmax(probability_classifier_pt, colour_images):
     """With apply_softmax false the module's probabilities are used as they are."""
     model = make_torch_classifier(probability_classifier_pt, apply_softmax=False)
-    probabilities, _ = model.predict(colour_images)
     raw = torch.load(probability_classifier_pt, weights_only=False).eval()
-    for path, probs in zip(colour_images, probabilities):
-        image = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32, scale=True)])(load_image(path))
+    to_input = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32, scale=True)])
+    for image in colour_images:
+        probs, _ = model.predict(image)
         with torch.inference_mode():
-            expected = raw(image.unsqueeze(0))[0]
+            expected = raw(to_input(image).unsqueeze(0))[0]
         assert torch.allclose(probs, expected, atol=1e-6)
 
 
@@ -343,42 +271,21 @@ def test_torch_preprocessing_runs_after_tensor_conversion(probability_classifier
     model = make_torch_classifier(
         probability_classifier_pt, apply_softmax=False, preprocessing={"normalize": normalise}
     )
-    probabilities, _ = model.predict(colour_images)
     raw = torch.load(probability_classifier_pt, weights_only=False).eval()
-    to_input = v2.Compose(
-        [v2.ToImage(), v2.ToDtype(torch.float32, scale=True), v2.Normalize(**normalise)]
-    )
-    for path, probs in zip(colour_images, probabilities):
+    to_input = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32, scale=True), v2.Normalize(**normalise)])
+    for image in colour_images:
+        probs, _ = model.predict(image)
         with torch.inference_mode():
-            expected = raw(to_input(load_image(path)).unsqueeze(0))[0]
+            expected = raw(to_input(image).unsqueeze(0))[0]
         assert torch.allclose(probs, expected, atol=1e-6)
 
 
-def test_torch_classifier_taxonomy_length_mismatch_raises(logits_classifier_pt, colour_images):
-    """A model output width different from the number of configured classes is rejected."""
-    model = make_torch_classifier(logits_classifier_pt, classes=TAXA[:2])
-    with pytest.raises(ValueError):
-        model.predict(colour_images[:1])
-
-
-def test_torch_images_of_different_size_without_resize_raise(
-    logits_classifier_pt, colour_images, odd_size_image
-):
-    """Images that cannot be stacked into one batch give a clear ValueError."""
+def test_torch_classifier_takes_images_of_any_size(logits_classifier_pt):
+    """One image per call: images of different sizes need no resize in the preprocessing."""
     model = make_torch_classifier(logits_classifier_pt)
-    with pytest.raises(ValueError):
-        model.predict([colour_images[0], odd_size_image])
-
-
-def test_torch_images_of_different_size_with_resize_work(
-    logits_classifier_pt, colour_images, odd_size_image
-):
-    """A resize in the preprocessing node makes differently sized images stackable."""
-    model = make_torch_classifier(
-        logits_classifier_pt, preprocessing={"resize": {"size": [16, 16], "antialias": True}}
-    )
-    probabilities, payload = model.predict([colour_images[0], odd_size_image])
-    assert len(probabilities) == len(payload) == 2
+    for size in [(32, 32), (48, 40), (7, 13)]:
+        probs, _ = model.predict(Image.new("RGB", size, (10, 200, 30)))
+        assert probs.shape == (len(TAXA),)
 
 
 def test_torch_unimportable_model_class_raises_import_error(tmp_path):
@@ -394,8 +301,8 @@ def test_torch_unimportable_model_class_raises_import_error(tmp_path):
 
         path = _save_module(vanishing_models.Vanishing(), tmp_path / "vanishing.pt")
     # the package directory is off sys.path again; forget the imported module for good
-    sys.modules.pop("vanishing_models")
-    with pytest.raises(ImportError, match="importable"):
+    sys.modules.pop("vanishing_models", None)
+    with pytest.raises(ImportError, match="vanishing_models"):
         make_torch_classifier(path)
 
 
@@ -406,22 +313,27 @@ def test_torch_pickled_non_module_raises(data_dir):
         make_torch_classifier(path)
 
 
+def test_torch_preprocessing_must_produce_tensors(logits_classifier_pt, colour_images):
+    """Torch models need tensors; a config that turns them back into PIL images is a TypeError."""
+    model = make_torch_classifier(logits_classifier_pt, preprocessing={"to_pil_image": {}})
+    with pytest.raises(TypeError):
+        model.predict(colour_images[0])
+
+
 # --------------------------------------------------------------------- torch detector
 
 
-def test_torch_detector_payload_and_padding(fixed_detector_pt, colour_images):
-    """Boxes are BoundingBoxes aligned with sorted scores; zero-score padding rows are
-    dropped even at conf_limit 0 and never raise, although their boxes are invalid."""
+def test_torch_detector_payload_labels_and_padding(fixed_detector_pt, colour_images):
+    """Detections are labelled from `labels` by class index, aligned with sorted scores;
+    zero-score padding rows are dropped even at conf_limit 0 and never raise, although
+    their boxes and class indices are invalid."""
     model = make_torch_detector(fixed_detector_pt, conf_limit=0.0)
-    probabilities, payload = model.predict(colour_images[:2])
+    scores, detections = model.predict(colour_images[0])
 
-    assert len(probabilities) == len(payload) == 2
-    for scores, boxes in zip(probabilities, payload):
-        assert_detector_payload(scores, boxes, conf_limit=0.0)
-        assert scores.tolist() == pytest.approx([0.95, 0.6, 0.05])
-        assert _box_coords(boxes) == pytest.approx(
-            [0.2, 0.1, 0.9, 0.8, 0.1, 0.2, 0.4, 0.5, 0.3, 0.3, 0.6, 0.6]
-        )
+    assert_detector_payload(scores, detections, conf_limit=0.0)
+    assert scores.tolist() == pytest.approx([0.95, 0.6, 0.05])
+    assert [d.detected_class for d in detections] == ["human", "animal", "vehicle"]
+    assert _box_coords(detections) == pytest.approx([0.2, 0.1, 0.9, 0.8, 0.1, 0.2, 0.4, 0.5, 0.3, 0.3, 0.6, 0.6])
 
 
 @PROPERTY_SETTINGS
@@ -429,25 +341,115 @@ def test_torch_detector_payload_and_padding(fixed_detector_pt, colour_images):
 def test_torch_detector_conf_limit(fixed_detector_pt, colour_images, conf_limit):
     """Only real rows with score >= conf_limit are kept, sorted descending, scores aligned."""
     model = make_torch_detector(fixed_detector_pt, conf_limit=conf_limit)
-    probabilities, payload = model.predict(colour_images[:1])
+    scores, detections = model.predict(colour_images[0])
     scores32 = torch.tensor(DETECTOR_ROWS)[:, 4]  # float32, like the pipeline's comparison
     kept = scores32[(scores32 > 0) & (scores32 >= conf_limit)]
-    expected = sorted(kept.tolist(), reverse=True)
-    assert probabilities[0].tolist() == pytest.approx(expected)
-    assert_detector_payload(probabilities[0], payload[0], conf_limit)
+    assert scores.tolist() == pytest.approx(sorted(kept.tolist(), reverse=True))
+    assert_detector_payload(scores, detections, conf_limit)
+
+
+def test_torch_detector_boxes_follow_the_image(colour_detector_pt):
+    """The detector's rows depend on the image it is given: red and blue images get
+    different, correctly converted boxes and scores."""
+    model = make_torch_detector(colour_detector_pt)
+    red_scores, red = model.predict(Image.new("RGB", (32, 32), (255, 0, 0)))
+    blue_scores, blue = model.predict(Image.new("RGB", (32, 32), (0, 0, 255)))
+
+    assert red_scores.tolist() == pytest.approx([0.95])
+    assert _box_coords(red) == pytest.approx([0.1, 0.1, 0.2, 0.2])
+    assert blue_scores.tolist() == pytest.approx([0.05])
+    assert _box_coords(blue) == pytest.approx([0.1, 0.1, 0.2, 0.9])
+    assert [d.detected_class for d in red + blue] == ["animal", "animal"]
+
+
+def test_torch_detector_checks_only_kept_rows(data_dir, colour_images):
+    """A real row below conf_limit is dropped without validating its box and class index."""
+    rows = [[0.1, 0.1, 0.5, 0.5, 0.9, 0.0], [2.0, -1.0, 0.5, 0.5, 0.3, 99.0]]
+    path = _save_module(tiny_models.FixedRowsDetector(rows), data_dir / "below_limit.pt")
+    scores, detections = make_torch_detector(path, conf_limit=0.5).predict(colour_images[0])
+    assert scores.tolist() == pytest.approx([0.9])
+    assert [d.detected_class for d in detections] == ["animal"]
 
 
 def test_torch_detector_number_of_rows_may_vary_between_calls(data_dir, colour_images):
-    """K may differ per call; each call's rows end up with the right image."""
+    """K may differ per call; each call returns its own rows."""
     row_sets = [
-        [[0.1, 0.1, 0.2, 0.2, 0.9]],
-        [[0.1, 0.1, 0.2, 0.2, 0.9], [0.3, 0.3, 0.4, 0.4, 0.8]],
-        [[0.1, 0.1, 0.2, 0.2, 0.9], [0.3, 0.3, 0.4, 0.4, 0.8], [0.5, 0.5, 0.6, 0.6, 0.7]],
+        [[0.1, 0.1, 0.2, 0.2, 0.9, 0.0]],
+        [[0.1, 0.1, 0.2, 0.2, 0.9, 0.0], [0.3, 0.3, 0.4, 0.4, 0.8, 1.0]],
+        [[0.1, 0.1, 0.2, 0.2, 0.9, 0.0], [0.3, 0.3, 0.4, 0.4, 0.8, 1.0], [0.5, 0.5, 0.6, 0.6, 0.7, 2.0]],
     ]
     path = _save_module(tiny_models.VaryingRowsDetector(row_sets), data_dir / "varying.pt")
-    model = make_torch_detector(path, batch_size=1)
-    _, payload = model.predict(colour_images[:3])
-    assert [len(boxes) for boxes in payload] == [1, 2, 3]
+    model = make_torch_detector(path)
+    counts = [len(model.predict(image)[1]) for image in colour_images[:3]]
+    assert counts == [1, 2, 3]
+
+
+def test_label_map_renames_mapped_labels_only(fixed_detector_pt, colour_images):
+    """Mapped labels are renamed; unmapped labels are returned verbatim."""
+    model = make_torch_detector(fixed_detector_pt, label_map={"animal": "rodent", "vehicle": "car"})
+    _, detections = model.predict(colour_images[0])
+    assert [d.detected_class for d in detections] == ["human", "rodent", "car"]
+
+
+def test_label_map_with_unknown_label_raises(fixed_detector_pt):
+    """A label_map key the model cannot emit (e.g. a typo) is an error, not a silent no-op."""
+    with pytest.raises(ValueError, match="anmal"):
+        make_torch_detector(fixed_detector_pt, label_map={"anmal": "rodent"})
+
+
+@pytest.mark.parametrize(
+    ("label_map", "error"),
+    [
+        (["animal"], TypeError),
+        ({"animal": 1}, TypeError),
+        ({1: "animal"}, TypeError),
+        ({"animal": ""}, ValueError),
+        ({"": "animal"}, ValueError),
+    ],
+)
+def test_invalid_label_map_fails_before_download(hub_stub, label_map, error):
+    """label_map must map non-empty strings to non-empty strings; checked before any weights."""
+    with pytest.raises(error):
+        TorchDetector(
+            info=INFO,
+            hf_repo="org/repo",
+            hf_filename="det.pt",
+            preprocessing={},
+            conf_limit=0.1,
+            labels=DETECTOR_LABELS,
+            label_map=label_map,
+        )
+    assert hub_stub == []
+
+
+@pytest.mark.parametrize(
+    ("labels", "error"),
+    [
+        ([], ValueError),
+        (["animal", "animal"], ValueError),
+        (["animal", ""], ValueError),
+        (["animal", 1], TypeError),
+        ("animal", TypeError),
+    ],
+)
+def test_invalid_torch_detector_labels_fail_before_download(hub_stub, labels, error):
+    """labels must be a non-empty list of unique, non-empty strings; checked before any weights."""
+    with pytest.raises(error):
+        TorchDetector(
+            info=INFO,
+            hf_repo="org/repo",
+            hf_filename="det.pt",
+            preprocessing={},
+            conf_limit=0.1,
+            labels=labels,
+        )
+    assert hub_stub == []
+
+
+def test_torch_detector_requires_labels(fixed_detector_pt):
+    """TorchDetector has no default label set."""
+    with pytest.raises(TypeError):
+        TorchDetector(info=INFO, model_path=fixed_detector_pt, preprocessing={}, conf_limit=0.1)
 
 
 # ------------------------------------------------------------- torch contract checks
@@ -471,7 +473,7 @@ def test_torch_classifier_contract_violations_raise(data_dir, colour_images, mod
     path = _save_module(tiny_models.ContractBreaker(mode, width=len(TAXA)), data_dir / f"cls_{mode}.pt")
     model = make_torch_classifier(path, apply_softmax=apply_softmax)
     with pytest.raises(ValueError):
-        model.predict(colour_images[:2])
+        model.predict(colour_images[0])
 
 
 @pytest.mark.parametrize(
@@ -479,12 +481,17 @@ def test_torch_classifier_contract_violations_raise(data_dir, colour_images, mod
     [
         "det_tuple",
         "det_rank2",
-        "det_last_dim",
+        "det_five_columns",
         "det_batch",
         "det_score_range",
         "det_score_nan",
+        "det_score_negative",
         "det_box_range",
         "det_box_inverted",
+        "det_box_inverted_y",
+        "det_class_fraction",
+        "det_class_negative",
+        "det_class_too_large",
     ],
 )
 def test_torch_detector_contract_violations_raise(data_dir, colour_images, mode):
@@ -492,54 +499,35 @@ def test_torch_detector_contract_violations_raise(data_dir, colour_images, mode)
     path = _save_module(tiny_models.ContractBreaker(mode), data_dir / f"det_{mode}.pt")
     model = make_torch_detector(path, conf_limit=0.25)
     with pytest.raises(ValueError):
-        model.predict(colour_images[:2])
+        model.predict(colour_images[0])
 
 
-# ------------------------------------------------------------ predict contract (3.1)
+# ------------------------------------------------------------------ predict input
 
 
-def test_predict_on_empty_list_returns_empty_results(logits_classifier_pt, fixed_detector_pt):
-    """No paths, no results, for classifiers and detectors alike."""
-    assert make_torch_classifier(logits_classifier_pt).predict([]) == ([], [])
-    assert make_torch_detector(fixed_detector_pt).predict([]) == ([], [])
-
-
-@pytest.mark.parametrize("single_path", ["image.jpg", Path("image.jpg")])
-def test_predict_rejects_a_single_path(logits_classifier_pt, single_path):
-    """predict takes a list of paths; a bare str/Path is an error, not a sequence of characters."""
-    with pytest.raises(TypeError):
-        make_torch_classifier(logits_classifier_pt).predict(single_path)
-
-
-def test_torch_preprocessing_must_produce_tensors(logits_classifier_pt, colour_images):
-    """Torch models need tensors; a config that turns them back into PIL images is a TypeError."""
-    model = make_torch_classifier(logits_classifier_pt, preprocessing={"to_pil_image": {}})
-    with pytest.raises(TypeError):
-        model.predict(colour_images[:1])
-
-
-def test_predict_on_missing_file_raises(logits_classifier_pt, tmp_path):
-    """A missing image is an error, not a silently skipped entry."""
-    model = make_torch_classifier(logits_classifier_pt)
-    with pytest.raises(FileNotFoundError):
-        model.predict([tmp_path / "does_not_exist.jpg"])
-
-
-def test_load_image_applies_exif_orientation(tmp_path):
-    """An EXIF 'rotate 90' tag is applied: width and height come back swapped."""
-    path = tmp_path / "rotated.jpg"
-    exif = Image.Exif()
-    exif[0x0112] = 6  # orientation: rotate 90 CW
-    Image.new("RGB", (40, 20), (200, 10, 10)).save(path, exif=exif)
-    assert load_image(path).size == (20, 40)
+@pytest.mark.parametrize(
+    "not_an_image",
+    [
+        [Image.new("RGB", (8, 8))],
+        "image.jpg",
+        Path("image.jpg"),
+        np.zeros((8, 8, 3), dtype=np.uint8),
+        torch.zeros(3, 8, 8),
+    ],
+)
+def test_predict_takes_one_pil_image(logits_classifier_pt, fixed_detector_pt, not_an_image):
+    """predict takes exactly one PIL image: lists, paths, arrays and tensors are TypeErrors."""
+    for model in [make_torch_classifier(logits_classifier_pt), make_torch_detector(fixed_detector_pt)]:
+        with pytest.raises(TypeError):
+            model.predict(not_an_image)
 
 
 @pytest.mark.parametrize("mode", ["L", "RGBA", "P"])
-def test_load_image_converts_to_rgb(tmp_path, mode):
-    """Grayscale, alpha and palette images come back as RGB."""
-    path = tmp_path / f"image_{mode}.png"
-    Image.new(mode, (8, 8)).save(path)
-    assert load_image(path).mode == "RGB"
+def test_predict_rejects_non_rgb_images(logits_classifier_pt, fixed_detector_pt, mode):
+    """Models expect RGB input; converting is the caller's job."""
+    for model in [make_torch_classifier(logits_classifier_pt), make_torch_detector(fixed_detector_pt)]:
+        with pytest.raises(ValueError):
+            model.predict(Image.new(mode, (8, 8)))
 
 
 # ------------------------------------------------------------------- build_transform
@@ -560,7 +548,7 @@ def test_build_transform_empty_is_identity(preprocessing):
 
 
 DETERMINISTIC_TRANSFORMS = [
-    ("resize", {"size": [16, 16], "antialias": True}, v2.Resize),
+    ("resize", {"size": [16, 16], "interpolation": "bilinear", "antialias": True}, v2.Resize),
     ("center_crop", {"size": [10, 10]}, v2.CenterCrop),
     ("grayscale", {"num_output_channels": 3}, v2.Grayscale),
     ("random_horizontal_flip", {"p": 1.0}, v2.RandomHorizontalFlip),
@@ -597,9 +585,10 @@ def test_build_transform_name_matching_ignores_case_and_underscores():
     assert np.array_equal(np.asarray(flipped), np.asarray(image)[:, ::-1])
 
 
-@pytest.mark.parametrize("name", ["no_such_transform", "functional", "query_size"])
+@pytest.mark.parametrize("name", ["no_such_transform", "functional", "query_size", "transform"])
 def test_build_transform_rejects_unknown_and_non_transform_names(name):
-    """Only v2.Transform subclasses resolve; anything else is a ValueError."""
+    """Only concrete v2.Transform subclasses resolve; anything else (including the abstract
+    base `Transform`) is a ValueError."""
     with pytest.raises(ValueError):
         build_transform({name: {}})
 
@@ -609,12 +598,6 @@ def test_build_transform_rejects_non_mapping_kwargs(kwargs):
     """Transform kwargs must be a mapping."""
     with pytest.raises(TypeError):
         build_transform({"resize": kwargs})
-
-
-def test_build_transform_rejects_abstract_base_transform():
-    """The abstract v2.Transform base is not a usable transform."""
-    with pytest.raises(ValueError):
-        build_transform({"transform": {}})
 
 
 @pytest.mark.parametrize("name", [1, None, ("resize",)])
@@ -631,13 +614,90 @@ def test_build_transform_rejects_non_mapping_node(preprocessing):
         build_transform(preprocessing)
 
 
-# --------------------------------------------------------- config and __init__ checks
+# --------------------------------------------------------- constructor validation
+
+
+def test_model_info_is_kept(logits_classifier_pt, fixed_detector_pt):
+    """The configured info is available as a ModelInfo, for the API response."""
+    assert make_torch_classifier(logits_classifier_pt).info == ModelInfo(**INFO)
+    assert make_torch_detector(fixed_detector_pt).info == ModelInfo(**INFO)
+
+
+def test_missing_info_raises(logits_classifier_pt):
+    """info is required: the response must name the model that ran."""
+    with pytest.raises(TypeError):
+        TorchClassifier(
+            model_path=logits_classifier_pt, preprocessing={}, conf_limit=0.1, classes=TAXA, apply_softmax=True
+        )
+
+
+@pytest.mark.parametrize("info", [{}, {"version": "1"}, "tiny-model", {"name": "x", "verison": "1"}])
+def test_invalid_info_fails_before_download(hub_stub, info):
+    """info must be a valid ModelInfo (a mapping with a name, no misspelled keys); checked
+    before any weights."""
+    with pytest.raises(ValueError):
+        TorchClassifier(
+            info=info,
+            hf_repo="org/repo",
+            hf_filename="cls.pt",
+            preprocessing={},
+            conf_limit=0.1,
+            classes=TAXA,
+            apply_softmax=True,
+        )
+    assert hub_stub == []
 
 
 def test_missing_preprocessing_raises(logits_classifier_pt):
     """The preprocessing node is required."""
     with pytest.raises(TypeError):
-        TorchClassifier(model_path=logits_classifier_pt, conf_limit=0.1, classes=TAXA, apply_softmax=True)
+        TorchClassifier(info=INFO, model_path=logits_classifier_pt, conf_limit=0.1, classes=TAXA, apply_softmax=True)
+
+
+def test_torch_classifier_requires_apply_softmax(logits_classifier_pt):
+    """apply_softmax has no default: logits vs probabilities must be stated."""
+    with pytest.raises(TypeError):
+        TorchClassifier(info=INFO, model_path=logits_classifier_pt, preprocessing={}, conf_limit=0.1, classes=TAXA)
+
+
+def test_torch_classifier_requires_classes(logits_classifier_pt):
+    """classes has no default: every output index needs its taxonomy."""
+    with pytest.raises(TypeError):
+        TorchClassifier(
+            info=INFO, model_path=logits_classifier_pt, preprocessing={}, conf_limit=0.1, apply_softmax=True
+        )
+
+
+@pytest.mark.parametrize("classes", ["Rattus", {"genus": "Rattus"}, 3])
+def test_non_list_classes_fail_before_download(hub_stub, classes):
+    """classes must be a list of taxonomy entries (a single mapping or string is an error)."""
+    with pytest.raises(TypeError):
+        TorchClassifier(
+            info=INFO, hf_repo="org/repo", hf_filename="cls.pt", preprocessing={}, conf_limit=0.1,
+            classes=classes, apply_softmax=True,
+        )
+    assert hub_stub == []
+
+
+def test_yolo_classifier_requires_classes(tmp_path):
+    """classes has no default for YOLO classifiers either (checked before any weights)."""
+    with pytest.raises(TypeError):
+        YoloClassifier(info=INFO, model_path=tmp_path / "missing.pt", preprocessing={}, conf_limit=0.1)
+
+
+@pytest.mark.parametrize("conf_limit", [0, 1])
+def test_integer_conf_limit_is_accepted(logits_classifier_pt, colour_images, conf_limit):
+    """YAML `conf_limit: 0` / `1` are ints; they are valid limits (at 1, typically nothing is kept)."""
+    probs, classifications = make_torch_classifier(logits_classifier_pt, conf_limit=conf_limit).predict(
+        colour_images[0]
+    )
+    assert len(classifications) == int((probs >= conf_limit).sum())
+
+
+def test_batch_size_is_not_an_argument(logits_classifier_pt):
+    """There is no batching: batch_size is an unknown argument."""
+    with pytest.raises(TypeError):
+        make_torch_classifier(logits_classifier_pt, batch_size=4)
 
 
 def test_model_path_and_hf_repo_together_raise(logits_classifier_pt, hub_stub):
@@ -650,11 +710,13 @@ def test_model_path_and_hf_repo_together_raise(logits_classifier_pt, hub_stub):
 @pytest.mark.parametrize("model_class", [TorchClassifier, TorchDetector, YoloClassifier, YoloDetector])
 def test_neither_model_path_nor_hf_repo_raises(model_class):
     """Without a default (only SpeciesNet has one), a weights source is required."""
-    kwargs = {"preprocessing": {}, "conf_limit": 0.1}
+    kwargs = {"info": INFO, "preprocessing": {}, "conf_limit": 0.1}
     if model_class in (TorchClassifier, YoloClassifier):
         kwargs["classes"] = TAXA
     if model_class is TorchClassifier:
         kwargs["apply_softmax"] = True
+    if model_class is TorchDetector:
+        kwargs["labels"] = DETECTOR_LABELS
     with pytest.raises(ValueError):
         model_class(**kwargs)
 
@@ -662,15 +724,10 @@ def test_neither_model_path_nor_hf_repo_raises(model_class):
 def test_hf_repo_without_filename_raises(hub_stub):
     """A Hub download needs the file name."""
     with pytest.raises(ValueError):
-        TorchClassifier(hf_repo="org/repo", preprocessing={}, conf_limit=0.1, classes=TAXA, apply_softmax=True)
+        TorchClassifier(
+            info=INFO, hf_repo="org/repo", preprocessing={}, conf_limit=0.1, classes=TAXA, apply_softmax=True
+        )
     assert hub_stub == []
-
-
-@pytest.mark.parametrize("conf_limit", [-0.1, 1.1, float("nan")])
-def test_conf_limit_outside_unit_interval_raises(logits_classifier_pt, conf_limit):
-    """conf_limit must lie in [0, 1]."""
-    with pytest.raises(ValueError):
-        make_torch_classifier(logits_classifier_pt, conf_limit=conf_limit)
 
 
 @pytest.mark.parametrize("stray", [{"hf_filename": "m.pt"}, {"hf_revision": "v1"}])
@@ -679,6 +736,13 @@ def test_hub_arguments_without_hf_repo_raise(logits_classifier_pt, hub_stub, str
     with pytest.raises(ValueError):
         make_torch_classifier(logits_classifier_pt, **stray)
     assert hub_stub == []
+
+
+@pytest.mark.parametrize("conf_limit", [-0.1, 1.1, float("nan")])
+def test_conf_limit_outside_unit_interval_raises(logits_classifier_pt, conf_limit):
+    """conf_limit must lie in [0, 1]."""
+    with pytest.raises(ValueError):
+        make_torch_classifier(logits_classifier_pt, conf_limit=conf_limit)
 
 
 @pytest.mark.parametrize("conf_limit", ["0.5", None, True])
@@ -695,11 +759,7 @@ def test_non_bool_apply_softmax_raises(logits_classifier_pt, apply_softmax):
         make_torch_classifier(logits_classifier_pt, apply_softmax=apply_softmax)
 
 
-@pytest.mark.parametrize(("batch_size", "error"), [(0, ValueError), (-3, ValueError), (True, TypeError), (2.5, TypeError)])
-def test_invalid_batch_size_raises(logits_classifier_pt, batch_size, error):
-    """batch_size must be None or an int >= 1; bool and float are rejected explicitly."""
-    with pytest.raises(error):
-        make_torch_classifier(logits_classifier_pt, batch_size=batch_size)
+# ------------------------------------------------------------------------ load_model
 
 
 def _write_config(path: Path, config) -> Path:
@@ -708,62 +768,102 @@ def _write_config(path: Path, config) -> Path:
     return path
 
 
-def _classifier_config(model_path: Path) -> dict:
-    """A complete TorchClassifier config."""
+def _classifier_kwargs(model_path: Path) -> dict:
+    """Complete TorchClassifier keyword arguments (a config file adds `type`)."""
     return {
+        "info": INFO,
         "model_path": str(model_path),
         "preprocessing": {"resize": {"size": [16, 16], "antialias": True}},
         "conf_limit": 0.1,
-        "batch_size": 2,
         "classes": TAXA,
         "apply_softmax": True,
     }
 
 
-def test_from_config_matches_keyword_construction(logits_classifier_pt, colour_images, tmp_path):
-    """A model built from a config file predicts exactly like one built from the same kwargs."""
-    config = _classifier_config(logits_classifier_pt)
-    from_file = TorchClassifier.from_config(_write_config(tmp_path / "cls.yaml", config))
-    from_kwargs = TorchClassifier(**config)
+def test_load_model_matches_keyword_construction(logits_classifier_pt, colour_images, tmp_path):
+    """A model loaded from a config file is of the class named in `type` and predicts exactly
+    like one built from the same kwargs."""
+    kwargs = _classifier_kwargs(logits_classifier_pt)
+    from_file = load_model(_write_config(tmp_path / "cls.yaml", {"type": "TorchClassifier"} | kwargs))
+    from_kwargs = TorchClassifier(**kwargs)
 
-    probs_file, payload_file = from_file.predict(colour_images)
-    probs_kwargs, payload_kwargs = from_kwargs.predict(colour_images)
-    for a, b in zip(probs_file, probs_kwargs):
-        assert torch.equal(a, b)
-    assert payload_file == payload_kwargs
+    assert type(from_file) is TorchClassifier
+    assert from_file.info == from_kwargs.info
+    for image in colour_images:
+        probs_file, payload_file = from_file.predict(image)
+        probs_kwargs, payload_kwargs = from_kwargs.predict(image)
+        assert torch.equal(probs_file, probs_kwargs)
+        assert payload_file == payload_kwargs
 
 
-def test_from_config_with_null_preprocessing_node(logits_classifier_pt, colour_images, tmp_path):
+def test_load_model_builds_a_torch_detector(fixed_detector_pt, colour_images, tmp_path):
+    """`type: TorchDetector` builds a detector from the remaining keys."""
+    config = {
+        "type": "TorchDetector",
+        "info": INFO,
+        "model_path": str(fixed_detector_pt),
+        "preprocessing": {},
+        "conf_limit": 0.5,
+        "labels": DETECTOR_LABELS,
+        "label_map": {"human": "person"},
+    }
+    model = load_model(_write_config(tmp_path / "det.yaml", config))
+    assert type(model) is TorchDetector
+    _, detections = model.predict(colour_images[0])
+    assert [d.detected_class for d in detections] == ["person", "animal"]
+
+
+def test_load_model_builds_speciesnet(speciesnet_stub, tmp_path):
+    """`type: SpeciesnetDetector` builds SpeciesNet, which needs no weights source."""
+    config = {"type": "SpeciesnetDetector", "info": INFO, "preprocessing": {}, "conf_limit": 0.1}
+    model = load_model(_write_config(tmp_path / "speciesnet.yaml", config))
+    assert type(model) is SpeciesnetDetector
+    assert speciesnet_stub.instances[-1].model_name == SPECIESNET_V403B
+
+
+def test_load_model_with_null_preprocessing_node(logits_classifier_pt, colour_images, tmp_path):
     """A bare `preprocessing:` (YAML null) counts as an empty node."""
     path = tmp_path / "cls.yaml"
     path.write_text(
-        f"model_path: {logits_classifier_pt}\npreprocessing:\nconf_limit: 0.1\napply_softmax: true\n"
-        + yaml.safe_dump({"classes": TAXA})
+        f"type: TorchClassifier\nmodel_path: {logits_classifier_pt}\npreprocessing:\nconf_limit: 0.1\n"
+        "apply_softmax: true\n" + yaml.safe_dump({"info": INFO, "classes": TAXA})
     )
-    probabilities, _ = TorchClassifier.from_config(path).predict(colour_images[:1])
-    assert len(probabilities) == 1
+    probs, _ = load_model(path).predict(colour_images[0])
+    assert probs.shape == (len(TAXA),)
 
 
-def test_from_config_missing_preprocessing_raises(logits_classifier_pt, tmp_path):
-    """The preprocessing node is required in config files, too."""
-    config = _classifier_config(logits_classifier_pt)
-    del config["preprocessing"]
+@pytest.mark.parametrize("model_type", [None, "ResNet", "torchclassifier", "ModelBase", 3])
+def test_load_model_unknown_or_missing_type_raises(logits_classifier_pt, tmp_path, model_type):
+    """`type` must name one of the five model classes exactly."""
+    config = _classifier_kwargs(logits_classifier_pt)
+    if model_type is not None:
+        config["type"] = model_type
+    with pytest.raises(ValueError):
+        load_model(_write_config(tmp_path / "cls.yaml", config))
+
+
+@pytest.mark.parametrize("removed", ["preprocessing", "info"])
+def test_load_model_missing_required_key_raises(logits_classifier_pt, tmp_path, removed):
+    """Required keys are required in config files, too."""
+    config = {"type": "TorchClassifier"} | _classifier_kwargs(logits_classifier_pt)
+    del config[removed]
     with pytest.raises(TypeError):
-        TorchClassifier.from_config(_write_config(tmp_path / "cls.yaml", config))
+        load_model(_write_config(tmp_path / "cls.yaml", config))
 
 
-def test_from_config_unknown_key_raises(logits_classifier_pt, tmp_path):
+@pytest.mark.parametrize("extra", [{"learning_rate": 0.1}, {"batch_size": 4}])
+def test_load_model_unknown_key_raises(logits_classifier_pt, tmp_path, extra):
     """Unknown config keys are errors, not silently ignored."""
-    config = _classifier_config(logits_classifier_pt) | {"learning_rate": 0.1}
+    config = {"type": "TorchClassifier"} | _classifier_kwargs(logits_classifier_pt) | extra
     with pytest.raises(TypeError):
-        TorchClassifier.from_config(_write_config(tmp_path / "cls.yaml", config))
+        load_model(_write_config(tmp_path / "cls.yaml", config))
 
 
 @pytest.mark.parametrize("content", [["a", "b"], "just a string", 42])
-def test_from_config_non_mapping_top_level_raises(tmp_path, content):
+def test_load_model_non_mapping_top_level_raises(tmp_path, content):
     """A config file must contain a mapping at the top level."""
     with pytest.raises(TypeError):
-        TorchClassifier.from_config(_write_config(tmp_path / "cls.yaml", content))
+        load_model(_write_config(tmp_path / "cls.yaml", content))
 
 
 # ------------------------------------------------------------------ Hugging Face Hub
@@ -786,6 +886,7 @@ def hub_stub(monkeypatch, logits_classifier_pt):
 def test_hf_download_is_used_and_loaded(hub_stub, colour_images, revision):
     """HF args are forwarded to hf_hub_download and the downloaded file is loaded."""
     model = TorchClassifier(
+        info=INFO,
         hf_repo="org/rodent-models",
         hf_filename="weights/classifier.pt",
         hf_revision=revision,
@@ -794,11 +895,9 @@ def test_hf_download_is_used_and_loaded(hub_stub, colour_images, revision):
         classes=TAXA,
         apply_softmax=True,
     )
-    assert hub_stub == [
-        {"repo_id": "org/rodent-models", "filename": "weights/classifier.pt", "revision": revision}
-    ]
-    probabilities, _ = model.predict(colour_images[:1])
-    assert probabilities[0].shape == (len(TAXA),)
+    assert hub_stub == [{"repo_id": "org/rodent-models", "filename": "weights/classifier.pt", "revision": revision}]
+    probs, _ = model.predict(colour_images[0])
+    assert probs.shape == (len(TAXA),)
 
 
 @pytest.mark.parametrize(
@@ -807,11 +906,13 @@ def test_hf_download_is_used_and_loaded(hub_stub, colour_images, revision):
         {"preprocessing": {"no_such_transform": {}}},
         {"classes": [{"species": "rattus"}]},  # genus is required
         {"classes": [{"genus": "Rattus", "specis": "norvegicus"}]},  # misspelled key
+        {"classes": []},  # a classifier needs at least one class
     ],
 )
 def test_invalid_config_fails_before_download(hub_stub, bad_args):
     """Config errors surface before any weights are resolved or downloaded."""
     kwargs = {
+        "info": INFO,
         "hf_repo": "org/rodent-models",
         "hf_filename": "weights/classifier.pt",
         "preprocessing": {},
@@ -824,56 +925,26 @@ def test_invalid_config_fails_before_download(hub_stub, bad_args):
     assert hub_stub == []
 
 
-# -------------------------------------------------------------------------- taxonomy
-
-
-def test_taxon_requires_genus():
-    """Taxonomy entries are validated; genus is mandatory."""
-    with pytest.raises(ValidationError):
-        Taxon(species="rattus")
-
-
-def test_classification_json_is_unchanged_by_taxon_base():
-    """Classification = Taxon + confidence; its serialised JSON keeps the previous keys,
-    order and content."""
-    taxon = Taxon(**TAXA[0])
-    classification = Classification(**taxon.model_dump(), confidence=0.7)
-    serialised = json.loads(classification.model_dump_json())
-    assert list(serialised) == [
-        "kingdom",
-        "phylum",
-        "class_name",
-        "order",
-        "family",
-        "genus",
-        "species",
-        "common_name",
-        "confidence",
-    ]
-    assert serialised == TAXA[0] | {"confidence": 0.7}
-
-
 # --------------------------------------------------------- returned tensors (all types)
 
 
-def _assert_ordinary_tensors(tensors: list[torch.Tensor]) -> None:
-    """Returned tensors are normal CPU tensors that callers may modify in place."""
-    for tensor in tensors:
-        assert tensor.device.type == "cpu"
-        assert not tensor.is_inference()
-        tensor.mul_(1.0)  # raises for inference tensors
+def _assert_ordinary_tensor(tensor: torch.Tensor) -> None:
+    """A returned tensor is a normal CPU tensor that callers may modify in place."""
+    assert tensor.device.type == "cpu"
+    assert not tensor.is_inference()
+    tensor.mul_(1.0)  # raises for inference tensors
 
 
 @pytest.mark.parametrize("apply_softmax", [True, False])
 def test_torch_classifier_returns_ordinary_tensors(probability_classifier_pt, colour_images, apply_softmax):
     """No inference-mode tensors leak out of predict, whatever the output dtype path."""
     model = make_torch_classifier(probability_classifier_pt, apply_softmax=apply_softmax)
-    _assert_ordinary_tensors(model.predict(colour_images[:2])[0])
+    _assert_ordinary_tensor(model.predict(colour_images[0])[0])
 
 
 def test_torch_detector_returns_ordinary_tensors(fixed_detector_pt, colour_images):
     """No inference-mode tensors leak out of a detector's predict."""
-    _assert_ordinary_tensors(make_torch_detector(fixed_detector_pt).predict(colour_images[:2])[0])
+    _assert_ordinary_tensor(make_torch_detector(fixed_detector_pt).predict(colour_images[0])[0])
 
 
 # ---------------------------------------------------------------------------- YOLO
@@ -889,9 +960,14 @@ def yolo_weights(pytestconfig):
     """
     from ultralytics import YOLO
 
+    cache = getattr(pytestconfig, "cache", None)
+    if cache is None:
+        pytest.fail("the YOLO tests keep their weights in the pytest cache; do not run with -p no:cacheprovider")
+    weights_dir = cache.mkdir("yolo_weights")
+
     def weights(name: str) -> Path:
+        path = weights_dir / name
         try:
-            path = pytestconfig.cache.mkdir("yolo_weights") / name
             if not path.exists():
                 YOLO(str(path))
         except Exception as error:  # any failure here means the fixture is unusable
@@ -909,31 +985,60 @@ def ultralytics_images() -> dict[str, Path]:
     return {"bus": ASSETS / "bus.jpg", "zidane": ASSETS / "zidane.jpg"}
 
 
-def _direct_yolo_scores(weights: Path, images: list[Image.Image], conf: float) -> list[list[float]]:
-    """Per-image box scores of a plain ultralytics call on PIL images, all classes kept."""
+def _direct_yolo_detections(weights: Path, image: Image.Image, conf: float) -> list[tuple[float, str]]:
+    """(score, COCO name) of every box of a plain ultralytics call, sorted by descending score."""
     from ultralytics import YOLO
 
-    results = YOLO(str(weights)).predict(source=images, conf=conf, device="cpu", verbose=False)
-    return [sorted(r.boxes.conf.cpu().tolist(), reverse=True) for r in results]
+    model = YOLO(str(weights))
+    result = model.predict(source=image, conf=conf, device="cpu", verbose=False)[0]
+    pairs = [(score, model.names[int(cls)]) for score, cls in zip(result.boxes.conf.tolist(), result.boxes.cls.tolist())]
+    return sorted(pairs, key=lambda pair: pair[0], reverse=True)
 
 
-def test_yolo_detector_returns_class_agnostic_boxes(yolo_weights, ultralytics_images):
-    """The pretrained COCO detector: every box of every class is kept (same scores as a
-    plain ultralytics call on the same images), results map to the right image, and the
-    payload is plain BoundingBoxes aligned with sorted scores above conf_limit."""
+def test_yolo_detector_returns_labelled_boxes_of_all_classes(yolo_weights, ultralytics_images):
+    """The pretrained COCO detector: every box of every class is kept and labelled with its
+    COCO name, with the same scores as a plain ultralytics call, sorted above conf_limit."""
     weights = yolo_weights("yolo26n.pt")
-    model = YoloDetector(model_path=weights, preprocessing={}, conf_limit=0.25)
-    paths = [ultralytics_images["bus"], ultralytics_images["zidane"]]
-    probabilities, payload = model.predict(paths)
+    model = YoloDetector(info=INFO, model_path=weights, preprocessing={}, conf_limit=0.25)
+    image = _open_rgb(ultralytics_images["bus"])
+    scores, detections = model.predict(image)
 
-    expected = _direct_yolo_scores(weights, [load_image(path) for path in paths], conf=0.25)
-    assert len(probabilities) == len(payload) == 2
-    assert len(payload[0]) > 0
-    for scores, expected_scores in zip(probabilities, expected):
-        assert scores.tolist() == pytest.approx(expected_scores, abs=1e-4)
-    for scores, boxes in zip(probabilities, payload):
-        assert_detector_payload(scores, boxes, conf_limit=0.25)
-    _assert_ordinary_tensors(probabilities)
+    expected = _direct_yolo_detections(weights, image, conf=0.25)
+    assert scores.tolist() == pytest.approx([score for score, _ in expected], abs=1e-4)
+    # compared as sorted (score, label) pairs, so exactly tied scores cannot flip the order
+    returned = sorted((round(d.confidence, 4), d.detected_class) for d in detections)
+    assert returned == sorted((round(score, 4), name) for score, name in expected)
+    assert {"person", "bus"} <= {d.detected_class for d in detections}
+    assert_detector_payload(scores, detections, conf_limit=0.25)
+    _assert_ordinary_tensor(scores)
+
+
+def test_yolo_label_map_renames_coco_labels(yolo_weights, ultralytics_images):
+    """label_map renames COCO names: `bus` becomes `vehicle`, other labels stay."""
+    model = YoloDetector(
+        info=INFO,
+        model_path=yolo_weights("yolo26n.pt"),
+        preprocessing={},
+        conf_limit=0.25,
+        label_map={"bus": "vehicle"},
+    )
+    _, detections = model.predict(_open_rgb(ultralytics_images["bus"]))
+    labels = {d.detected_class for d in detections}
+    assert "vehicle" in labels
+    assert "bus" not in labels
+    assert "person" in labels
+
+
+def test_yolo_label_map_with_unknown_label_raises(yolo_weights):
+    """A label_map key that is no COCO name of the loaded model is rejected after loading."""
+    with pytest.raises(ValueError, match="buss"):
+        YoloDetector(
+            info=INFO,
+            model_path=yolo_weights("yolo26n.pt"),
+            preprocessing={},
+            conf_limit=0.25,
+            label_map={"buss": "vehicle"},
+        )
 
 
 def test_yolo_applies_configured_preprocessing(yolo_weights, ultralytics_images):
@@ -941,12 +1046,12 @@ def test_yolo_applies_configured_preprocessing(yolo_weights, ultralytics_images)
     detections as running ultralytics on the mirrored image."""
     weights = yolo_weights("yolo26n.pt")
     model = YoloDetector(
-        model_path=weights, preprocessing={"random_horizontal_flip": {"p": 1.0}}, conf_limit=0.25
+        info=INFO, model_path=weights, preprocessing={"random_horizontal_flip": {"p": 1.0}}, conf_limit=0.25
     )
-    probabilities, _ = model.predict([ultralytics_images["bus"]])
-    mirrored = ImageOps.mirror(load_image(ultralytics_images["bus"]))
-    expected = _direct_yolo_scores(weights, [mirrored], conf=0.25)
-    assert probabilities[0].tolist() == pytest.approx(expected[0], abs=1e-4)
+    image = _open_rgb(ultralytics_images["bus"])
+    scores, _ = model.predict(image)
+    expected = _direct_yolo_detections(weights, ImageOps.mirror(image), conf=0.25)
+    assert scores.tolist() == pytest.approx([score for score, _ in expected], abs=1e-4)
 
 
 def test_yolo_missing_non_asset_path_raises_without_network(tmp_path, monkeypatch):
@@ -959,17 +1064,17 @@ def test_yolo_missing_non_asset_path_raises_without_network(tmp_path, monkeypatc
 
     monkeypatch.setattr(socket.socket, "connect", record_connect)
     with pytest.raises(FileNotFoundError):
-        YoloDetector(model_path=tmp_path / "rodnet.pt", preprocessing={}, conf_limit=0.25)
+        YoloDetector(info=INFO, model_path=tmp_path / "rodnet.pt", preprocessing={}, conf_limit=0.25)
     assert attempts == []
 
 
 def test_yolo_rejects_non_pil_preprocessing_output(yolo_weights, ultralytics_images):
     """YOLO preprocesses internally, so configured transforms must keep PIL images."""
     model = YoloDetector(
-        model_path=yolo_weights("yolo26n.pt"), preprocessing={"pil_to_tensor": {}}, conf_limit=0.25
+        info=INFO, model_path=yolo_weights("yolo26n.pt"), preprocessing={"pil_to_tensor": {}}, conf_limit=0.25
     )
     with pytest.raises(TypeError):
-        model.predict([ultralytics_images["bus"]])
+        model.predict(_open_rgb(ultralytics_images["bus"]))
 
 
 def test_yolo_classifier_maps_probabilities_to_taxonomy(yolo_weights, ultralytics_images):
@@ -977,18 +1082,54 @@ def test_yolo_classifier_maps_probabilities_to_taxonomy(yolo_weights, ultralytic
     conf_limit-filtered classifications carrying the configured taxonomy."""
     taxa = placeholder_taxa(1000)  # one entry per ImageNet class
     model = YoloClassifier(
-        model_path=yolo_weights("yolo26n-cls.pt"), preprocessing={}, conf_limit=0.05, classes=taxa
+        info=INFO, model_path=yolo_weights("yolo26n-cls.pt"), preprocessing={}, conf_limit=0.05, classes=taxa
     )
-    probabilities, payload = model.predict([ultralytics_images["bus"]])
+    probs, classifications = model.predict(_open_rgb(ultralytics_images["bus"]))
 
-    assert_classifier_payload(probabilities[0], payload[0], taxa, conf_limit=0.05, sum_atol=1e-4)
-    _assert_ordinary_tensors(probabilities)
+    assert_classifier_payload(probs, classifications, taxa, conf_limit=0.05, sum_atol=1e-4)
+    _assert_ordinary_tensor(probs)
+
+
+def test_load_model_builds_yolo_models(yolo_weights, tmp_path):
+    """`type: YoloDetector` / `type: YoloClassifier` build the YOLO models."""
+    detector_config = {
+        "type": "YoloDetector",
+        "info": INFO,
+        "model_path": str(yolo_weights("yolo26n.pt")),
+        "preprocessing": {},
+        "conf_limit": 0.25,
+    }
+    classifier_config = {
+        "type": "YoloClassifier",
+        "info": INFO,
+        "model_path": str(yolo_weights("yolo26n-cls.pt")),
+        "preprocessing": {},
+        "conf_limit": 0.05,
+        "classes": placeholder_taxa(1000),
+    }
+    assert type(load_model(_write_config(tmp_path / "det.yaml", detector_config))) is YoloDetector
+    assert type(load_model(_write_config(tmp_path / "cls.yaml", classifier_config))) is YoloClassifier
+
+
+def test_yolo_weights_of_the_wrong_task_raise(yolo_weights):
+    """Classifier weights for a detector (and vice versa) are rejected at construction."""
+    with pytest.raises(ValueError, match="classify"):
+        YoloDetector(info=INFO, model_path=yolo_weights("yolo26n-cls.pt"), preprocessing={}, conf_limit=0.25)
+    with pytest.raises(ValueError, match="detect"):
+        YoloClassifier(
+            info=INFO,
+            model_path=yolo_weights("yolo26n.pt"),
+            preprocessing={},
+            conf_limit=0.05,
+            classes=placeholder_taxa(80),
+        )
 
 
 def test_yolo_classifier_taxonomy_count_mismatch_raises(yolo_weights):
     """The number of taxonomy entries must equal the model's number of classes."""
     with pytest.raises(ValueError):
         YoloClassifier(
+            info=INFO,
             model_path=yolo_weights("yolo26n-cls.pt"),
             preprocessing={},
             conf_limit=0.05,
@@ -1006,8 +1147,16 @@ def make_speciesnet_stub(detections: list[dict]):
     `device` / `model` attributes (initially not on CPU, like a GPU host), and
     `preprocess(PIL image)` / `predict(filepath, preprocessed)` returning SDK-shaped
     detections (relative [x_min, y_min, width, height] boxes, sorted by confidence).
+    `predict` only accepts what `preprocess` returned, so skipping the SDK's own
+    preprocessing fails. Every instance records the filepaths `predict` received.
     """
     instances = []
+
+    class Preprocessed:
+        """Marker for the output of the stub's `preprocess`."""
+
+        def __init__(self, image):
+            self.image = image
 
     class RecordingModule(torch.nn.Linear):
         """A tiny model that records whether it was moved (`.to()` / `.cpu()` both apply)."""
@@ -1025,15 +1174,18 @@ def make_speciesnet_stub(detections: list[dict]):
             self.model_name = model_name
             self.device = "cuda"
             self.model = RecordingModule(2, 2)
+            self.filepaths = []
             instances.append(self)
 
         def preprocess(self, img):
-            """Accept only PIL images, as the SDK does."""
-            assert isinstance(img, Image.Image)
-            return img
+            """Accept only RGB PIL images, as the SDK does."""
+            assert isinstance(img, Image.Image) and img.mode == "RGB"
+            return Preprocessed(img)
 
         def predict(self, filepath, img):
             """Return the configured detections, sorted by confidence like the SDK."""
+            assert isinstance(img, Preprocessed), "predict must get the output of preprocess"
+            self.filepaths.append(filepath)
             ordered = sorted(detections, key=lambda d: d["conf"], reverse=True)
             return {"filepath": filepath, "detections": [dict(d) for d in ordered]}
 
@@ -1055,7 +1207,10 @@ def sdk_detections(draw):
     # decided in float32, too
     confs = draw(
         st.lists(
-            st.floats(min_value=SPECIESNET_FLOOR_F32, max_value=1.0, width=32), min_size=count, max_size=count, unique=True
+            st.floats(min_value=SPECIESNET_FLOOR_F32, max_value=1.0, width=32),
+            min_size=count,
+            max_size=count,
+            unique=True,
         )
     )
     detections = []
@@ -1071,104 +1226,127 @@ def sdk_detections(draw):
 
 @PROPERTY_SETTINGS
 @given(detections=sdk_detections(), conf_limit=st.floats(min_value=SPECIESNET_FLOOR_F32, max_value=1.0, width=32))
-def test_speciesnet_keeps_animal_boxes_as_xyxy(colour_images, detections, conf_limit):
-    """Only animal boxes >= conf_limit survive, converted from xywh to xyxy, sorted by
-    score, without labels, and within the image."""
+def test_speciesnet_returns_labelled_boxes_as_xyxy(colour_images, detections, conf_limit):
+    """All boxes >= conf_limit survive with their SDK label, converted from xywh to xyxy,
+    sorted by score, and within the image."""
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr("ml_pipeline.models.model.SpeciesNetDetector", make_speciesnet_stub(detections))
-        model = SpeciesnetDetector(preprocessing={}, conf_limit=conf_limit)
-        probabilities, payload = model.predict(colour_images[:1])
+        model = SpeciesnetDetector(info=INFO, preprocessing={}, conf_limit=conf_limit)
+        scores, result = model.predict(colour_images[0])
 
-    expected = sorted(
-        (d for d in detections if d["label"] == "animal" and d["conf"] >= conf_limit),
-        key=lambda d: d["conf"],
-        reverse=True,
-    )
-    scores, boxes = probabilities[0], payload[0]
+    expected = sorted((d for d in detections if d["conf"] >= conf_limit), key=lambda d: d["conf"], reverse=True)
     assert scores.tolist() == pytest.approx([d["conf"] for d in expected])
-    assert len(boxes) == len(expected)
-    for box, detection in zip(boxes, expected):
-        x, y, w, h = detection["bbox"]
+    assert [d.detected_class for d in result] == [d["label"] for d in expected]
+    for detection, sdk in zip(result, expected):
+        x, y, w, h = sdk["bbox"]
+        box = detection.bbox
         assert (box.x_min, box.y_min, box.x_max, box.y_max) == pytest.approx((x, y, x + w, y + h))
         assert -1e-9 <= box.x_min <= box.x_max <= 1.0 + 1e-9
         assert -1e-9 <= box.y_min <= box.y_max <= 1.0 + 1e-9
+        assert detection.classifications == []
 
 
 @pytest.fixture
 def speciesnet_stub(monkeypatch):
-    """Install a SpeciesNet stub with one animal and one human detection."""
+    """Install a SpeciesNet stub with one detection of each label."""
     stub = make_speciesnet_stub(
         [
             _sdk_detection("animal", 0.8, [0.1, 0.2, 0.3, 0.4]),
             _sdk_detection("human", 0.9, [0.5, 0.5, 0.2, 0.2]),
+            _sdk_detection("vehicle", 0.3, [0.0, 0.0, 0.1, 0.1]),
         ]
     )
     monkeypatch.setattr("ml_pipeline.models.model.SpeciesNetDetector", stub)
     return stub
 
 
+def test_speciesnet_label_set():
+    """SpeciesNet's detector emits exactly these labels."""
+    assert tuple(SpeciesnetDetector.LABELS) == ("animal", "human", "vehicle")
+
+
+def test_speciesnet_keeps_human_and_vehicle(speciesnet_stub, colour_images):
+    """Humans and vehicles are returned with their SDK label, not dropped."""
+    model = SpeciesnetDetector(info=INFO, preprocessing={}, conf_limit=0.1)
+    scores, detections = model.predict(colour_images[0])
+    assert [d.detected_class for d in detections] == ["human", "animal", "vehicle"]
+    assert scores.tolist() == pytest.approx([0.9, 0.8, 0.3])
+    _assert_ordinary_tensor(scores)
+
+
+def test_speciesnet_label_map(speciesnet_stub, colour_images):
+    """label_map renames SDK labels like any other detector's."""
+    model = SpeciesnetDetector(info=INFO, preprocessing={}, conf_limit=0.1, label_map={"human": "person"})
+    _, detections = model.predict(colour_images[0])
+    assert [d.detected_class for d in detections] == ["person", "animal", "vehicle"]
+
+
+def test_speciesnet_label_map_with_unknown_label_raises(speciesnet_stub):
+    """Only animal, human and vehicle can be mapped."""
+    with pytest.raises(ValueError, match="person"):
+        SpeciesnetDetector(info=INFO, preprocessing={}, conf_limit=0.1, label_map={"person": "human"})
+
+
+def test_speciesnet_gets_a_placeholder_filepath(speciesnet_stub, colour_images):
+    """Models receive no paths; the SDK, which only echoes its filepath, gets the placeholder."""
+    model = SpeciesnetDetector(info=INFO, preprocessing={}, conf_limit=0.1)
+    model.predict(colour_images[0])
+    model.predict(colour_images[1])
+    expected = SpeciesnetDetector.SDK_FILEPATH_PLACEHOLDER
+    assert speciesnet_stub.instances[-1].filepaths == [expected, expected]
+
+
 def test_speciesnet_defaults_to_v403b(speciesnet_stub):
     """Without model_path the pinned SpeciesNet v4.0.3b Kaggle model is requested."""
-    SpeciesnetDetector(preprocessing={}, conf_limit=0.1)
+    SpeciesnetDetector(info=INFO, preprocessing={}, conf_limit=0.1)
     assert speciesnet_stub.instances[-1].model_name == SPECIESNET_V403B
 
 
 @pytest.mark.parametrize("model_path", ["./models/speciesnet/", "kaggle:google/speciesnet/pyTorch/v4.0.3a/1"])
 def test_speciesnet_passes_model_path_unchanged(speciesnet_stub, model_path):
     """Local folders and Kaggle ids reach the SDK exactly as configured."""
-    SpeciesnetDetector(model_path=model_path, preprocessing={}, conf_limit=0.1)
+    SpeciesnetDetector(info=INFO, model_path=model_path, preprocessing={}, conf_limit=0.1)
     assert speciesnet_stub.instances[-1].model_name == model_path
 
 
 def test_speciesnet_runs_on_cpu(speciesnet_stub):
     """The SDK picks its own device (the stub pretends CUDA); the pipeline forces CPU."""
-    SpeciesnetDetector(preprocessing={}, conf_limit=0.1)
+    SpeciesnetDetector(info=INFO, preprocessing={}, conf_limit=0.1)
     detector = speciesnet_stub.instances[-1]
     assert detector.device == "cpu"
     assert detector.model.moved
     assert all(p.device.type == "cpu" for p in detector.model.parameters())
 
 
-@pytest.mark.parametrize("batch_size", [None, 1])
-def test_speciesnet_one_result_per_image(speciesnet_stub, colour_images, batch_size):
-    """Several images (batch_size None or 1) give one result each; humans are dropped."""
-    model = SpeciesnetDetector(preprocessing={}, conf_limit=0.1, batch_size=batch_size)
-    probabilities, payload = model.predict(colour_images[:3])
-    assert len(probabilities) == len(payload) == 3
-    for scores, boxes in zip(probabilities, payload):
-        assert scores.tolist() == pytest.approx([0.8])
-        assert _box_coords(boxes) == pytest.approx([0.1, 0.2, 0.4, 0.6])
-    _assert_ordinary_tensors(probabilities)
-
-
 def test_speciesnet_hub_download_not_implemented(speciesnet_stub, hub_stub):
     """SpeciesNet is not published on the Hugging Face Hub."""
     with pytest.raises(NotImplementedError):
-        SpeciesnetDetector(hf_repo="org/speciesnet", hf_filename="model.pt", preprocessing={}, conf_limit=0.1)
+        SpeciesnetDetector(
+            info=INFO, hf_repo="org/speciesnet", hf_filename="model.pt", preprocessing={}, conf_limit=0.1
+        )
     assert hub_stub == []
 
 
-@pytest.mark.parametrize(
-    "bad_args",
-    [
-        {"preprocessing": {"resize": {"size": [16, 16]}}},
-        {"batch_size": 2},
-        {"conf_limit": 0.005},
-    ],
-)
+@pytest.mark.parametrize("bad_args", [{"preprocessing": {"resize": {"size": [16, 16]}}}, {"conf_limit": 0.005}])
 def test_speciesnet_invalid_settings_raise(speciesnet_stub, bad_args):
-    """SpeciesNet preprocesses itself, works per image and has a 0.01 score floor."""
-    kwargs = {"preprocessing": {}, "conf_limit": 0.1} | bad_args
+    """SpeciesNet preprocesses itself and has a 0.01 score floor."""
+    kwargs = {"info": INFO, "preprocessing": {}, "conf_limit": 0.1} | bad_args
     with pytest.raises(ValueError):
         SpeciesnetDetector(**kwargs)
     assert speciesnet_stub.instances == []
+
+
+def test_speciesnet_accepts_its_score_floor(speciesnet_stub):
+    """conf_limit 0.01, the SDK's floor itself, is valid."""
+    SpeciesnetDetector(info=INFO, preprocessing={}, conf_limit=0.01)
+    assert len(speciesnet_stub.instances) == 1
 
 
 @pytest.mark.parametrize("preprocessing", [3, ["resize"]])
 def test_speciesnet_non_mapping_preprocessing_raises(speciesnet_stub, preprocessing):
     """A preprocessing node that is not a mapping is a TypeError, as for every model."""
     with pytest.raises(TypeError):
-        SpeciesnetDetector(preprocessing=preprocessing, conf_limit=0.1)
+        SpeciesnetDetector(info=INFO, preprocessing=preprocessing, conf_limit=0.1)
     assert speciesnet_stub.instances == []
 
 
@@ -1176,13 +1354,13 @@ def test_speciesnet_non_mapping_preprocessing_raises(speciesnet_stub, preprocess
 def test_speciesnet_non_numeric_conf_limit_raises(speciesnet_stub, conf_limit):
     """A non-numeric conf_limit gets the explicit TypeError, not a comparison error."""
     with pytest.raises(TypeError, match="conf_limit"):
-        SpeciesnetDetector(preprocessing={}, conf_limit=conf_limit)
+        SpeciesnetDetector(info=INFO, preprocessing={}, conf_limit=conf_limit)
 
 
 @pytest.mark.parametrize("preprocessing", [{}, None])
 def test_speciesnet_accepts_empty_preprocessing(speciesnet_stub, preprocessing):
     """An empty preprocessing node, `{}` or YAML null, is accepted."""
-    SpeciesnetDetector(preprocessing=preprocessing, conf_limit=0.1)
+    SpeciesnetDetector(info=INFO, preprocessing=preprocessing, conf_limit=0.1)
     assert len(speciesnet_stub.instances) == 1
 
 
@@ -1190,7 +1368,7 @@ def test_speciesnet_accepts_empty_preprocessing(speciesnet_stub, preprocessing):
 
 
 @pytest.mark.speciesnet_integration
-def test_real_speciesnet_detects_rodent_and_ignores_people(ultralytics_images):
+def test_real_speciesnet_detects_rodent_and_people(ultralytics_images):
     """Real SpeciesNet inference. Run with RUN_SPECIESNET_INTEGRATION=1.
 
     SPECIESNET_MODEL may name a local model folder or Kaggle id; otherwise the pinned
@@ -1202,13 +1380,11 @@ def test_real_speciesnet_detects_rodent_and_ignores_people(ultralytics_images):
     if "SPECIESNET_MODEL" in os.environ:
         model_kwargs["model_path"] = os.environ["SPECIESNET_MODEL"]
 
-    model = SpeciesnetDetector(preprocessing={}, conf_limit=0.25, **model_kwargs)
-    rodent = Path(__file__).parent / "data" / "rodent.jpg"
-    probabilities, payload = model.predict([rodent, ultralytics_images["zidane"]])
+    model = SpeciesnetDetector(info=INFO, preprocessing={}, conf_limit=0.5, **model_kwargs)
+    _, rodent = model.predict(_open_rgb(Path(__file__).parent / "data" / "rodent.jpg"))
+    _, people = model.predict(_open_rgb(ultralytics_images["zidane"]))
 
-    assert len(payload[0]) >= 1
-    for box in payload[0]:
-        assert 0.0 <= box.x_min <= box.x_max <= 1.0
-        assert 0.0 <= box.y_min <= box.y_max <= 1.0
-    # people only: no animal box with a confident score
-    assert all(score < 0.5 for score in probabilities[1].tolist())
+    assert "animal" in {d.detected_class for d in rodent}
+    labels = {d.detected_class for d in people}
+    assert "animal" not in labels
+    assert "human" in labels
