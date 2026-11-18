@@ -150,10 +150,6 @@ def colour_detector_pt(data_dir) -> Path:
     return _save_module(tiny_models.ColourDetector(), data_dir / "colour_detector.pt")
 
 
-PROBE_WIDTH = 8
-PROBE_TAXA = [{"genus": f"Genus{i}", "species": f"species{i}"} for i in range(PROBE_WIDTH)]
-
-
 @pytest.fixture(scope="session")
 def batch_probe_pt(data_dir) -> Path:
     """Tiny classifier whose output reveals the batch size it was called with."""
@@ -180,9 +176,52 @@ def make_torch_detector(model_path: Path, **overrides) -> TorchDetector:
     return TorchDetector(**kwargs)
 
 
-def species_index(classification: Classification) -> int:
-    """Return the TAXA index of a classification (species names are unique in TAXA)."""
-    return [taxon["species"] for taxon in TAXA].index(classification.species)
+def placeholder_taxa(count: int) -> list[dict]:
+    """Minimal taxonomy entries (genus + species), one per class index."""
+    return [{"genus": f"Genus{i}", "species": f"species{i}"} for i in range(count)]
+
+
+def assert_classifier_payload(
+    probs: torch.Tensor,
+    classifications: list[Classification],
+    taxa: list[dict],
+    conf_limit: float,
+    sum_atol: float,
+) -> None:
+    """Shared classifier invariants for one image: a CPU probability vector over all classes
+    summing to 1, and classifications sorted descending, all >= conf_limit, complete w.r.t.
+    conf_limit, each carrying the taxonomy and probability of its output index.
+    (Species names are unique within every taxonomy used here.)"""
+    assert probs.shape == (len(taxa),)
+    assert probs.device.type == "cpu"
+    assert torch.isclose(probs.sum(), torch.tensor(1.0), atol=sum_atol)
+    confidences = [c.confidence for c in classifications]
+    assert confidences == sorted(confidences, reverse=True)
+    assert all(c >= conf_limit for c in confidences)
+    assert len(classifications) == int((probs >= conf_limit).sum())
+    species = [taxon["species"] for taxon in taxa]
+    for classification in classifications:
+        assert isinstance(classification, Classification)
+        index = species.index(classification.species)
+        assert classification.confidence == pytest.approx(float(probs[index]))
+        assert classification.model_dump(exclude={"confidence"}) == Taxon(**taxa[index]).model_dump()
+
+
+def assert_detector_payload(scores: torch.Tensor, boxes: list[BoundingBox], conf_limit: float) -> None:
+    """Shared detector invariants for one image: CPU scores aligned with BoundingBoxes, sorted
+    descending, all >= conf_limit, boxes in relative coordinates with min <= max."""
+    assert scores.device.type == "cpu"
+    assert len(scores) == len(boxes)
+    assert scores.tolist() == sorted(scores.tolist(), reverse=True)
+    assert all(score >= conf_limit for score in scores.tolist())
+    for box in boxes:
+        assert isinstance(box, BoundingBox)
+        assert 0.0 <= box.x_min <= box.x_max <= 1.0
+        assert 0.0 <= box.y_min <= box.y_max <= 1.0
+
+
+PROBE_WIDTH = 8
+PROBE_TAXA = placeholder_taxa(PROBE_WIDTH)
 
 
 # ------------------------------------------------------------------- torch classifier
@@ -280,18 +319,7 @@ def test_torch_classifier_payload_invariants(logits_classifier_pt, colour_images
     probabilities, payload = model.predict(colour_images)
 
     for probs, classifications in zip(probabilities, payload):
-        assert probs.shape == (len(TAXA),)
-        assert probs.device.type == "cpu"
-        assert torch.isclose(probs.sum(), torch.tensor(1.0), atol=1e-5)
-        confidences = [c.confidence for c in classifications]
-        assert confidences == sorted(confidences, reverse=True)
-        assert all(c >= conf_limit for c in confidences)
-        assert len(classifications) == int((probs >= conf_limit).sum())
-        for classification in classifications:
-            assert isinstance(classification, Classification)
-            index = species_index(classification)
-            assert classification.confidence == pytest.approx(float(probs[index]))
-            assert classification.model_dump(exclude={"confidence"}) == TAXA[index]
+        assert_classifier_payload(probs, classifications, TAXA, conf_limit, sum_atol=1e-5)
 
 
 def test_torch_classifier_accepts_probabilities_without_softmax(
@@ -389,9 +417,8 @@ def test_torch_detector_payload_and_padding(fixed_detector_pt, colour_images):
 
     assert len(probabilities) == len(payload) == 2
     for scores, boxes in zip(probabilities, payload):
-        assert scores.device.type == "cpu"
+        assert_detector_payload(scores, boxes, conf_limit=0.0)
         assert scores.tolist() == pytest.approx([0.95, 0.6, 0.05])
-        assert all(isinstance(box, BoundingBox) for box in boxes)
         assert _box_coords(boxes) == pytest.approx(
             [0.2, 0.1, 0.9, 0.8, 0.1, 0.2, 0.4, 0.5, 0.3, 0.3, 0.6, 0.6]
         )
@@ -407,7 +434,7 @@ def test_torch_detector_conf_limit(fixed_detector_pt, colour_images, conf_limit)
     kept = scores32[(scores32 > 0) & (scores32 >= conf_limit)]
     expected = sorted(kept.tolist(), reverse=True)
     assert probabilities[0].tolist() == pytest.approx(expected)
-    assert len(payload[0]) == len(expected)
+    assert_detector_payload(probabilities[0], payload[0], conf_limit)
 
 
 def test_torch_detector_number_of_rows_may_vary_between_calls(data_dir, colour_images):
@@ -905,14 +932,7 @@ def test_yolo_detector_returns_class_agnostic_boxes(yolo_weights, ultralytics_im
     for scores, expected_scores in zip(probabilities, expected):
         assert scores.tolist() == pytest.approx(expected_scores, abs=1e-4)
     for scores, boxes in zip(probabilities, payload):
-        assert scores.device.type == "cpu"
-        assert len(scores) == len(boxes)
-        assert scores.tolist() == sorted(scores.tolist(), reverse=True)
-        assert all(score >= 0.25 for score in scores.tolist())
-        for box in boxes:
-            assert isinstance(box, BoundingBox)
-            assert 0.0 <= box.x_min <= box.x_max <= 1.0
-            assert 0.0 <= box.y_min <= box.y_max <= 1.0
+        assert_detector_payload(scores, boxes, conf_limit=0.25)
     _assert_ordinary_tensors(probabilities)
 
 
@@ -952,31 +972,16 @@ def test_yolo_rejects_non_pil_preprocessing_output(yolo_weights, ultralytics_ima
         model.predict([ultralytics_images["bus"]])
 
 
-def _imagenet_taxa(count: int) -> list[dict]:
-    """Placeholder taxonomy entries, one per ImageNet class index."""
-    return [{"genus": f"Genus{i}", "species": f"species{i}"} for i in range(count)]
-
-
 def test_yolo_classifier_maps_probabilities_to_taxonomy(yolo_weights, ultralytics_images):
     """The pretrained ImageNet classifier: full probability vector plus sorted,
     conf_limit-filtered classifications carrying the configured taxonomy."""
-    taxa = _imagenet_taxa(1000)
+    taxa = placeholder_taxa(1000)  # one entry per ImageNet class
     model = YoloClassifier(
         model_path=yolo_weights("yolo26n-cls.pt"), preprocessing={}, conf_limit=0.05, classes=taxa
     )
     probabilities, payload = model.predict([ultralytics_images["bus"]])
 
-    probs, classifications = probabilities[0], payload[0]
-    assert probs.shape == (1000,)
-    assert probs.device.type == "cpu"
-    assert torch.isclose(probs.sum(), torch.tensor(1.0), atol=1e-4)
-    confidences = [c.confidence for c in classifications]
-    assert confidences == sorted(confidences, reverse=True)
-    assert len(classifications) == int((probs >= 0.05).sum())
-    for classification in classifications:
-        index = int(classification.species.removeprefix("species"))
-        assert classification.genus == f"Genus{index}"
-        assert classification.confidence == pytest.approx(float(probs[index]))
+    assert_classifier_payload(probabilities[0], payload[0], taxa, conf_limit=0.05, sum_atol=1e-4)
     _assert_ordinary_tensors(probabilities)
 
 
@@ -987,7 +992,7 @@ def test_yolo_classifier_taxonomy_count_mismatch_raises(yolo_weights):
             model_path=yolo_weights("yolo26n-cls.pt"),
             preprocessing={},
             conf_limit=0.05,
-            classes=_imagenet_taxa(999),
+            classes=placeholder_taxa(999),
         )
 
 
@@ -1147,7 +1152,6 @@ def test_speciesnet_hub_download_not_implemented(speciesnet_stub, hub_stub):
     "bad_args",
     [
         {"preprocessing": {"resize": {"size": [16, 16]}}},
-        {"preprocessing": 3},  # not a mapping at all
         {"batch_size": 2},
         {"conf_limit": 0.005},
     ],
@@ -1157,6 +1161,14 @@ def test_speciesnet_invalid_settings_raise(speciesnet_stub, bad_args):
     kwargs = {"preprocessing": {}, "conf_limit": 0.1} | bad_args
     with pytest.raises(ValueError):
         SpeciesnetDetector(**kwargs)
+    assert speciesnet_stub.instances == []
+
+
+@pytest.mark.parametrize("preprocessing", [3, ["resize"]])
+def test_speciesnet_non_mapping_preprocessing_raises(speciesnet_stub, preprocessing):
+    """A preprocessing node that is not a mapping is a TypeError, as for every model."""
+    with pytest.raises(TypeError):
+        SpeciesnetDetector(preprocessing=preprocessing, conf_limit=0.1)
     assert speciesnet_stub.instances == []
 
 

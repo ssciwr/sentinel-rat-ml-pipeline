@@ -122,7 +122,8 @@ ModelBase[T] (ABC)                         # T = BoundingBox | Classification
  │      load RGB images -> self._preprocess(img) each -> chunk by batch_size (or one chunk if None) -> self._infer(chunk) -> concat
  ├── _preprocess(image)  (concrete: returns self.transform(image), unchecked)
  ├── _load_model(path)   (abstract)
- └── _infer(inputs, paths) -> tuple[list[Tensor], list[list[T]]]  (abstract; returns CPU tensors)
+ └── _infer(inputs, paths) -> list[tuple[Tensor, list[T]]]  (abstract; one (CPU tensor, payload) pair per image;
+ │                                                             predict splits the pairs into its two lists)
  │
  ├── DetectorBase(ModelBase[BoundingBox])   # helper: _make_boxes(xyxyn, scores) -> filters by conf_limit, sorts desc
  │     ├── YoloDetector                      # all boxes, class ignored

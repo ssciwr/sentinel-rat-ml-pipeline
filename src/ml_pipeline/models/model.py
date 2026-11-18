@@ -76,12 +76,7 @@ def build_transform(preprocessing: Mapping[str, Mapping[str, Any]] | None) -> v2
     if not isinstance(preprocessing, Mapping):
         raise TypeError(f"preprocessing must be a mapping of transform names to kwargs, got {preprocessing!r}")
 
-    available = {
-        _normalise_name(name): obj
-        for name, obj in vars(v2).items()
-        # the abstract base class itself is not a usable transform
-        if isinstance(obj, type) and issubclass(obj, v2.Transform) and obj is not v2.Transform
-    }
+    available = _available_transforms()
     transforms = []
     for name, kwargs in preprocessing.items():
         if not isinstance(name, str):
@@ -97,6 +92,16 @@ def build_transform(preprocessing: Mapping[str, Mapping[str, Any]] | None) -> v2
         # v2.Compose([]) raises, so an empty node needs its own explicit identity
         return v2.Identity()
     return v2.Compose(transforms)
+
+
+def _available_transforms() -> dict[str, type[v2.Transform]]:
+    """Map normalised names to the concrete `v2.Transform` subclasses of torchvision."""
+    return {
+        _normalise_name(name): obj
+        for name, obj in vars(v2).items()
+        # the abstract base class itself is not a usable transform
+        if isinstance(obj, type) and issubclass(obj, v2.Transform) and obj is not v2.Transform
+    }
 
 
 def _normalise_name(name: str) -> str:
@@ -250,15 +255,12 @@ class ModelBase[T](ABC):
         if len(image_paths) == 0:
             return [], []
         chunk_size = len(image_paths) if self.batch_size is None else self.batch_size
-        probabilities: list[torch.Tensor] = []
-        payload: list[list[T]] = []
+        results: list[tuple[torch.Tensor, list[T]]] = []
         for start in range(0, len(image_paths), chunk_size):
             chunk = image_paths[start : start + chunk_size]
             inputs = [self._preprocess(load_image(path)) for path in chunk]
-            chunk_probabilities, chunk_payload = self._infer(inputs, [str(path) for path in chunk])
-            probabilities.extend(chunk_probabilities)
-            payload.extend(chunk_payload)
-        return probabilities, payload
+            results.extend(self._infer(inputs, [str(path) for path in chunk]))
+        return [tensor for tensor, _ in results], [items for _, items in results]
 
     def _preprocess(self, image: Image.Image) -> Any:
         """Apply the configured transforms to one loaded image."""
@@ -269,8 +271,8 @@ class ModelBase[T](ABC):
         """Load the backend model from the resolved weights location."""
 
     @abstractmethod
-    def _infer(self, inputs: list[Any], paths: list[str]) -> tuple[list[torch.Tensor], list[list[T]]]:
-        """Run one batch of preprocessed images; return per-image CPU tensors and payloads."""
+    def _infer(self, inputs: list[Any], paths: list[str]) -> list[tuple[torch.Tensor, list[T]]]:
+        """Run one batch of preprocessed images; return one (CPU tensor, payload) pair per image."""
 
 
 def _validate_conf_limit(conf_limit: Any) -> None:
@@ -293,13 +295,6 @@ def _validate_batch_size(batch_size: Any) -> None:
 
 class DetectorBase(ModelBase[BoundingBox]):
     """Class-agnostic detectors: `predict` returns box scores and `BoundingBox` lists."""
-
-    @staticmethod
-    def _unzip(
-        per_image: list[tuple[torch.Tensor, list[BoundingBox]]],
-    ) -> tuple[list[torch.Tensor], list[list[BoundingBox]]]:
-        """Split per-image (scores, boxes) pairs into the two lists `predict` returns."""
-        return [scores for scores, _ in per_image], [boxes for _, boxes in per_image]
 
     def _make_boxes(self, xyxy: torch.Tensor, scores: torch.Tensor) -> tuple[torch.Tensor, list[BoundingBox]]:
         """Keep boxes with score >= conf_limit and sort them by descending score.
@@ -392,11 +387,10 @@ class YoloDetector(_UltralyticsMixin, DetectorBase):
 
     task = "detect"
 
-    def _infer(self, inputs: list[Any], paths: list[str]) -> tuple[list[torch.Tensor], list[list[BoundingBox]]]:
+    def _infer(self, inputs: list[Any], paths: list[str]) -> list[tuple[torch.Tensor, list[BoundingBox]]]:
         """Detect boxes in one batch of PIL images."""
         results = self._run_yolo(inputs, conf=self.conf_limit)
-        per_image = [self._make_boxes(r.boxes.xyxyn.cpu(), r.boxes.conf.cpu()) for r in results]
-        return self._unzip(per_image)
+        return [self._make_boxes(r.boxes.xyxyn.cpu(), r.boxes.conf.cpu()) for r in results]
 
 
 class YoloClassifier(_UltralyticsMixin, ClassifierBase):
@@ -419,12 +413,12 @@ class YoloClassifier(_UltralyticsMixin, ClassifierBase):
                 f"{len(self.classes)} taxonomy entries for a model with {len(self.model.names)} classes"
             )
 
-    def _infer(self, inputs: list[Any], paths: list[str]) -> tuple[list[torch.Tensor], list[list[Classification]]]:
+    def _infer(self, inputs: list[Any], paths: list[str]) -> list[tuple[torch.Tensor, list[Classification]]]:
         """Classify one batch of PIL images."""
         results = self._run_yolo(inputs)
         # clone: ultralytics computes under inference mode; callers get ordinary tensors
         probabilities = [r.probs.data.cpu().float().clone() for r in results]
-        return probabilities, [self._make_classifications(probs) for probs in probabilities]
+        return [(probs, self._make_classifications(probs)) for probs in probabilities]
 
 
 # -------------------------------------------------------------------------- torch
@@ -433,9 +427,8 @@ class YoloClassifier(_UltralyticsMixin, ClassifierBase):
 class _TorchModelMixin:
     """Shared loading and calling of plain `.pt` torch modules (see the contract in the plan, 3.4).
 
-    The file must hold a whole pickled `nn.Module` (`torch.load(..., weights_only=False)`).
-    Unpickling can run arbitrary code: load trusted files only, and make sure the package
-    defining the module class is importable here.
+    The file format and its trust requirements are documented on `TorchClassifier` and
+    `TorchDetector`.
 
     Model input: a float32 `[B, 3, H, W]` CPU tensor; each image is converted with
     `ToImage + ToDtype(float32, scale=True)` (values in [0, 1]) and then passed through the
@@ -488,6 +481,22 @@ class _TorchModelMixin:
         with torch.inference_mode():
             return self.model(batch)
 
+    @staticmethod
+    def _check_shape(output: Any, batch_size: int, rank: int, last_dim: int, expected: str) -> None:
+        """Raise ValueError naming the `expected` output unless `output` is one tensor of that shape.
+
+        Args:
+            output: What the module returned.
+            batch_size: B of the input batch; the output's first dimension.
+            rank: Required number of dimensions.
+            last_dim: Required size of the last dimension.
+            expected: Human-readable description of the contract, for the error message.
+        """
+        if not isinstance(output, torch.Tensor):
+            raise ValueError(f"model must return {expected}, got {type(output).__name__}")
+        if output.ndim != rank or output.shape[0] != batch_size or output.shape[-1] != last_dim:
+            raise ValueError(f"model must return {expected}, got shape {tuple(output.shape)}")
+
 
 def _outside_unit_interval(values: torch.Tensor) -> torch.Tensor:
     """Elementwise test for values outside [0, 1]; NaN counts as outside."""
@@ -518,7 +527,7 @@ class TorchClassifier(_TorchModelMixin, ClassifierBase):
         self.apply_softmax = apply_softmax
         super().__init__(**kwargs)
 
-    def _infer(self, inputs: list[torch.Tensor], paths: list[str]) -> tuple[list[torch.Tensor], list[list[Classification]]]:
+    def _infer(self, inputs: list[torch.Tensor], paths: list[str]) -> list[tuple[torch.Tensor, list[Classification]]]:
         """Classify one batch of preprocessed tensors."""
         output = self._forward(inputs)
         self._check_output(output, len(inputs))
@@ -527,18 +536,13 @@ class TorchClassifier(_TorchModelMixin, ClassifierBase):
         else:
             probabilities = output.float()
         # clone: the output was computed under inference mode; callers get ordinary tensors
-        rows = list(probabilities.cpu().clone())
-        return rows, [self._make_classifications(row) for row in rows]
+        rows = probabilities.cpu().clone()
+        return [(row, self._make_classifications(row)) for row in rows]
 
     def _check_output(self, output: Any, batch_size: int) -> None:
         """Raise ValueError naming the expected output if the module broke the contract."""
         expected = f"a single tensor [B={batch_size}, C={len(self.classes)}]"
-        if not isinstance(output, torch.Tensor):
-            raise ValueError(f"classifier must return {expected}, got {type(output).__name__}")
-        if output.ndim != 2 or output.shape[1] != len(self.classes):
-            raise ValueError(f"classifier must return {expected}, got shape {tuple(output.shape)}")
-        if output.shape[0] != batch_size:
-            raise ValueError(f"classifier must return {expected}, got shape {tuple(output.shape)}")
+        self._check_shape(output, batch_size, rank=2, last_dim=len(self.classes), expected=expected)
         if self.apply_softmax:
             if not torch.isfinite(output).all():
                 raise ValueError("classifier logits (apply_softmax: true) must be finite")
@@ -562,7 +566,7 @@ class TorchDetector(_TorchModelMixin, DetectorBase):
     the package defining the module class must be importable here.
     """
 
-    def _infer(self, inputs: list[torch.Tensor], paths: list[str]) -> tuple[list[torch.Tensor], list[list[BoundingBox]]]:
+    def _infer(self, inputs: list[torch.Tensor], paths: list[str]) -> list[tuple[torch.Tensor, list[BoundingBox]]]:
         """Detect boxes in one batch of preprocessed tensors."""
         output = self._forward(inputs)
         self._check_output(output, len(inputs))
@@ -571,19 +575,12 @@ class TorchDetector(_TorchModelMixin, DetectorBase):
         # and only kept rows must carry valid boxes.
         kept = (output[..., 4] > 0) & (output[..., 4] >= self.conf_limit)
         self._check_kept_boxes(output[kept][:, :4])
-        per_image = [self._make_boxes(rows[mask, :4], rows[mask, 4]) for rows, mask in zip(output, kept)]
-        return self._unzip(per_image)
+        return [self._make_boxes(rows[mask, :4], rows[mask, 4]) for rows, mask in zip(output, kept)]
 
-    @staticmethod
-    def _check_output(output: Any, batch_size: int) -> None:
+    def _check_output(self, output: Any, batch_size: int) -> None:
         """Raise ValueError naming the expected output if the module broke the contract."""
         expected = f"a single tensor [B={batch_size}, K, 5] of (x1, y1, x2, y2, score)"
-        if not isinstance(output, torch.Tensor):
-            raise ValueError(f"detector must return {expected}, got {type(output).__name__}")
-        if output.ndim != 3 or output.shape[2] != 5:
-            raise ValueError(f"detector must return {expected}, got shape {tuple(output.shape)}")
-        if output.shape[0] != batch_size:
-            raise ValueError(f"detector must return {expected}, got shape {tuple(output.shape)}")
+        self._check_shape(output, batch_size, rank=3, last_dim=5, expected=expected)
         if _outside_unit_interval(output[..., 4]).any():
             raise ValueError("detector scores must lie in [0, 1]")
 
@@ -622,6 +619,7 @@ class SpeciesnetDetector(DetectorBase):
 
     Raises:
         NotImplementedError: `hf_repo` was given.
+        TypeError: `preprocessing` is not a mapping, or `conf_limit` is not a number.
         ValueError: Non-empty preprocessing, `batch_size` other than None/1, or `conf_limit` < 0.01.
     """
 
@@ -645,7 +643,9 @@ class SpeciesnetDetector(DetectorBase):
                 "SpeciesNet is published on Kaggle, not on the Hugging Face Hub; "
                 "use model_path (a local model folder or a kaggle: id) instead of hf_repo"
             )
-        if preprocessing not in (None, {}):  # anything but an empty node, mappings or not
+        if preprocessing is not None and not isinstance(preprocessing, Mapping):
+            raise TypeError(f"preprocessing must be a mapping of transform names to kwargs, got {preprocessing!r}")
+        if preprocessing is not None and len(preprocessing) != 0:
             raise ValueError("SpeciesNet preprocesses images itself; its preprocessing node must be empty")
         if batch_size is not None and batch_size != 1:
             raise ValueError("SpeciesNet processes one image per call; batch_size must be omitted or 1")
@@ -671,10 +671,9 @@ class SpeciesnetDetector(DetectorBase):
         detector.model.to(self.DEVICE)
         return detector
 
-    def _infer(self, inputs: list[Image.Image], paths: list[str]) -> tuple[list[torch.Tensor], list[list[BoundingBox]]]:
+    def _infer(self, inputs: list[Image.Image], paths: list[str]) -> list[tuple[torch.Tensor, list[BoundingBox]]]:
         """Detect boxes image by image (the SDK has no batch API for its detector component)."""
-        per_image = [self._detect(image, path) for image, path in zip(inputs, paths)]
-        return self._unzip(per_image)
+        return [self._detect(image, path) for image, path in zip(inputs, paths)]
 
     def _detect(self, image: Image.Image, path: str) -> tuple[torch.Tensor, list[BoundingBox]]:
         """Run the SDK on one image and keep its animal boxes as relative xyxy corners."""
